@@ -1,0 +1,6 @@
+transformers
+datasets
+peft
+lightning
+einx[torch]
+wrapt
