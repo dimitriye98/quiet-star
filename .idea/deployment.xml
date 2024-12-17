@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@38.99.105.116:21652 agent" exclude=".svn;.cvs;.idea;.DS_Store;.git;.hg;*.hprof;*.pyc;.venv;venv" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="root@38.99.105.116:21652 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/quiet-star" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@38.99.105.121:21477 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/quiet-star-speedrun" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>

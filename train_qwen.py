@@ -1,8 +1,10 @@
 import os
 import time
 from collections import defaultdict
+from concurrent.futures.process import ProcessPoolExecutor
 from contextlib import nullcontext
 from functools import partial
+from os import cpu_count
 
 import einx
 import lightning.pytorch as pl
@@ -11,7 +13,7 @@ from peft import get_peft_model, LoraConfig
 from pytorch_lightning.loggers import WandbLogger
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, GenerationConfig, StaticCache
 
-from quiet_star.broker import BrokeredList
+from quiet_star.broker import CollectionBroker, be_nice
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
 from quiet_star.training.data import QuietStarDataModule
 
@@ -39,7 +41,12 @@ class QuietStar( pl.LightningModule ):
 		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
 		self.validation_pad_token = validation_pad_token
 		self.test_val_batch_size = test_val_batch_size
-		self.outputs = defaultdict( partial( BrokeredList, size = 16 ) )
+		self.broker = CollectionBroker( 1073741824 )
+		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
+		self.outputs = defaultdict( list )
+
+	def __del__( self ):
+		self.evaluation_pool.shutdown( wait = False, cancel_futures = True )
 
 	def configure_model( self ):
 		self.model = self.hparams.model_factory( self.hparams.config )
@@ -91,7 +98,6 @@ class QuietStar( pl.LightningModule ):
 	def validation_gen_config( self ):
 		if not hasattr( self, "_validation_gen_config" ):
 			self._validation_gen_config = GenerationConfig(
-				max_new_tokens = 10,
 				output_logits = True,
 				return_dict_in_generate = True,
 				pad_token_id = self.validation_pad_token,
@@ -108,55 +114,50 @@ class QuietStar( pl.LightningModule ):
 		output = self.model.generate(
 			inputs = batch[ "input_ids" ],
 			attention_mask = batch[ "attention_mask" ],
-			generation_config = self.validation_gen_config )
+			generation_config = self.validation_gen_config,
+			max_new_tokens = batch[ "answer" ].shape[ -1 ] )
 		logs = t.cat( [ l.unsqueeze( 0 ) for l in output.logits ], dim = 0 )
 		logs = einx.rearrange( "c ... v -> ... c v", logs )
-		batch[ "output" ] = logs
-		self.outputs[ dataloader_idx ].append( batch )
+		batch[ "output_ids" ] = output.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
+		batch[ "output_logits" ] = logs
+		future = self.broker( batch )
+		future.add_done_callback( partial( self.submit_for_eval, dataloader_idx ) )
 		if hasattr( self, "profiler" ):
 			self.profiler.step()
 
-	def on_validation_epoch_end( self ):
-		flat_outputs = [ ]
-		for lst in self.outputs.values():
-			flat_outputs.extend( lst )
+	def submit_for_eval( self, dataloader_idx, future ):
+		self.outputs[ dataloader_idx ].append(
+			self.evaluation_pool.submit( self.evaluate, future.result(), self.validation_pad_token ) )
 
-		logs, ans = [ ], [ ]
-
-		pad_to_length = 0
-		for b in flat_outputs:
-			a, l = b[ "answer" ], b[ "output" ]
-			assert a.shape[ 0 ] == l.shape[ 0 ]
-			a_len = a.shape[ -1 ]
-			l_ = l[ ..., : a_len, : ]  # trim to answer length
-			pad_to_length = max( pad_to_length, a_len )
-			logs.append( l_ )
-			ans.append( a )
-
-		def pad_right( tensor, dim, pad_len, value ):
-			pad_vals = [ (0, 0) ] * tensor.ndim
-			# ugly index manipulation because torch.nn.functional.pad is weird
-			pad_vals[ -1 - (dim % tensor.ndim) ] = (0, pad_len - tensor.shape[ dim ])
-			pad_vals = tuple( p for tup in pad_vals for p in tup )
-			return t.nn.functional.pad( tensor, pad_vals, value = value )
-
-		apply_pad = lambda l, d, p, v: [ pad_right( tensor, d, p, v ) for tensor in l ]
-		logs = apply_pad( logs, -2, pad_to_length, t.nan )
-		ans = apply_pad( ans, -1, pad_to_length, self.validation_pad_token )
-		logs, ans = t.cat( logs, dim = 0 ), t.cat( ans, dim = 0 )
-
+	@staticmethod
+	def evaluate( batch, pad_token ):
 		def compute_losses( l, a ):
 			l_ = einx.rearrange( "... v -> (...) v", l )
 			a_ = einx.rearrange( "... -> (...)", a )
-			losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" ).reshape_as( a )
-			losses = einx.where( "... s, , ... s", a == self.validation_pad_token, t.nan, losses )
-			return losses
+			losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" )
+			losses = einx.rearrange( "(b... s) -> b... s", losses, **einx.solve( "b... s", a ) )
+			losses = einx.where( "... s, , ... s", a == pad_token, t.nan, losses )
+			return losses.nanmean( dim = -1 )
 
-		losses = compute_losses( logs, ans )
-		losses = losses.reshape_as( ans )
+		def check_accuracy( s, a ):
+			return ((s == a) | (a == pad_token)).all( dim = -1 ).to( t.float32 )
 
-		loss = losses.nan_to_num( 1 ).prod( dim = - 1 ).mean()
-		self.log( "val_loss", loss, prog_bar = True )
+		return {
+			"loss": compute_losses( batch[ "output_logits" ], batch[ "answer" ] ),
+			"one-shot accuracy": check_accuracy( batch[ "output_ids" ], batch[ "answer" ] ),
+		}
+
+	def on_validation_epoch_end( self ):
+		flat_outputs = [ f.result() for l in self.outputs.values() for f in l ]
+
+		flat_dict = defaultdict( list )
+		for d in flat_outputs:
+			for k, v in d.items():
+				flat_dict[ k ].append( v )
+
+		means = { f"validation mean {k}": t.cat( v, dim = 0 ).mean() for k, v in flat_dict.items() }
+
+		self.log_dict( means, prog_bar = True )
 
 
 tokenizer = AutoTokenizer.from_pretrained( "Qwen/Qwen2.5-0.5B" )
@@ -164,7 +165,7 @@ tokenizer.padding_side = "left"
 tokenizer.add_special_tokens( { "additional_special_tokens": [ "<|startthought|>", "<|endthought|>" ] } )
 
 config = QwenThoughtModelConfig.from_pretrained(
-	"Qwen/Qwen2.5-0.5B",
+	"Qwen/Qwen2.5-3B",
 	start_thought_token = tokenizer.convert_tokens_to_ids( "<|startthought|>" ),
 	end_thought_token = tokenizer.convert_tokens_to_ids( "<|endthought|>" ),
 	initial_start_thought_token = tokenizer.convert_tokens_to_ids( "---" ),
@@ -176,14 +177,14 @@ config = QwenThoughtModelConfig.from_pretrained(
 
 def model_factory( config ):
 	peft_config = LoraConfig(
-		r = 8,
-		lora_alpha = 16,
+		r = 32,
+		lora_alpha = 64,
 		lora_dropout = 0.1,
 		use_rslora = True,
 		target_modules = "all-linear",
 	)
 
-	model = QwenThoughtModel.from_pretrained( "Qwen/Qwen2.5-0.5B", config = config )
+	model = QwenThoughtModel.from_pretrained( "Qwen/Qwen2.5-3B", config = config )
 
 	# Fix a bug with the underlying model
 	model._lm_model.resize_token_embeddings( len( tokenizer ) )
@@ -195,6 +196,8 @@ def model_factory( config ):
 
 	model._lm_model = get_peft_model( model._lm_model, peft_config )
 
+	print(f"Model has { model.num_parameters() } parameters, of which { model.num_parameters( only_trainable = True ) } are trainable")
+
 	return model
 
 
@@ -204,10 +207,10 @@ dm = QuietStarDataModule(
 )
 
 model = QuietStar(
-	config, model_factory, validation_pad_token = tokenizer.pad_token_id, test_val_batch_size = dm.test_val_batch_size )
+	config, model_factory, validation_pad_token = tokenizer.pad_token_id, train_batch_size = dm.train_batch_size, test_val_batch_size = dm.test_val_batch_size )
 
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
-	every_n_train_steps = 10,
+	every_n_train_steps = 50,
 	save_top_k = -1,
 )
 
@@ -252,7 +255,7 @@ with t.profiler.profile(
 		precision = "bf16-true",
 		max_epochs = 1,
 		check_val_every_n_epoch = None,
-		val_check_interval = 100,
+		val_check_interval = 250,
 		# accelerator = "auto",
 		# devices = 1,
 		accumulate_grad_batches = 4,
@@ -261,8 +264,8 @@ with t.profiler.profile(
 	)
 
 	try:
-		# trainer.fit( model, datamodule = dm )
-		trainer.validate( model, datamodule = dm )
+		trainer.fit( model, datamodule = dm )
+		# trainer.validate( model, datamodule = dm )
 	except t.OutOfMemoryError as e:
 		print( "OOM, dumping memory snapshot...", flush = True )
 		t.cuda.memory._dump_snapshot( os.path.join( trace_dir, "memory_snapshot.json" ) )

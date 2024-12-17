@@ -1,7 +1,9 @@
-transformers
 datasets
-peft
-lightning
 einx[torch]
-wrapt
+lightning
+peft
+toolz
+torch
+transformers
 wandb
+wrapt
