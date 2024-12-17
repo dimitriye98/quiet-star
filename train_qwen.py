@@ -10,6 +10,7 @@ import einx
 import lightning.pytorch as pl
 import numpy as np
 import torch as t
+from accelerate.utils import recursively_apply
 from dataclasses import dataclass, field
 from datasets import load_dataset, Dataset
 from lightning.fabric.utilities import move_data_to_device
@@ -21,6 +22,7 @@ from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, 
 	CompileConfig, PreTrainedTokenizer, PreTrainedTokenizerBase
 from transformers.cache_utils import StaticCacheConfig
 
+from quiet_star.broker import PinnedTensorBroker, LazyFuture
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
 
 # warnings.filterwarnings( "error", category = UserWarning, module = 'torch' )
@@ -144,7 +146,7 @@ class QuietStarDataModule( pl.LightningDataModule ):
 			self,
 			tokenizer,
 			train_batch_size = 2,
-			test_val_batch_size = 256,
+			test_val_batch_size = 1024,
 			preproc_batch_size = 1024,
 			max_length = 256,
 			n_download_proc = 1,
@@ -256,6 +258,7 @@ class QuietStar( pl.LightningModule ):
 		self.validation_pad_token = validation_pad_token
 		self.test_val_batch_size = test_val_batch_size
 		self.outputs = defaultdict( list )
+		self.brokers = {}
 
 	def configure_model( self ):
 		self.model = self.hparams.model_factory( self.hparams.config )
@@ -328,54 +331,60 @@ class QuietStar( pl.LightningModule ):
 		logs = t.cat( [ l.unsqueeze( 0 ) for l in output.logits ], dim = 0 )
 		logs = einx.rearrange( "c ... v -> ... c v", logs )
 		batch[ "output" ] = logs
-		self.outputs[ dataloader_idx ].append( batch )
+		self.outputs[ dataloader_idx ].append( recursively_apply(self.use_broker, batch, cm = t.inference_mode()) )
 		if hasattr(self, "profiler"):
 			self.profiler.step()
+
+	def use_broker( self, tensor, cm=None ):
+		broker = self.brokers.get((tensor.shape, tensor.dtype), None)
+		if broker is None:
+			broker = PinnedTensorBroker( tensor.shape, tensor.dtype, 16, cm=cm )
+			self.brokers[ (tensor.shape, tensor.dtype) ] = broker
+		return broker.send_to_cpu( tensor )
 
 	def on_validation_epoch_end( self ):
 		flat_outputs = [ ]
 		for lst in self.outputs.values():
 			flat_outputs.extend( lst )
 
-		with (t.no_grad()):
-			flat_outputs = move_data_to_device( flat_outputs, "cpu" )
+		flat_outputs = recursively_apply(lambda _: _.result(), flat_outputs, test_type = lambda _: isinstance(_, LazyFuture))
 
-			logs, ans = [ ], [ ]
+		logs, ans = [ ], [ ]
 
-			pad_to_length = 0
-			for b in flat_outputs:
-				a, l = b[ "answer" ], b[ "output" ]
-				assert a.shape[ 0 ] == l.shape[ 0 ]
-				a_len = a.shape[ -1 ]
-				l_ = l[ ..., : a_len, : ]  # trim to answer length
-				pad_to_length = max( pad_to_length, a_len )
-				logs.append( l_ )
-				ans.append( a )
+		pad_to_length = 0
+		for b in flat_outputs:
+			a, l = b[ "answer" ], b[ "output" ]
+			assert a.shape[ 0 ] == l.shape[ 0 ]
+			a_len = a.shape[ -1 ]
+			l_ = l[ ..., : a_len, : ]  # trim to answer length
+			pad_to_length = max( pad_to_length, a_len )
+			logs.append( l_ )
+			ans.append( a )
 
-			def pad_right( tensor, dim, pad_len, value ):
-				pad_vals = [ (0, 0) ] * tensor.ndim
-				# ugly index manipulation because torch.nn.functional.pad is weird
-				pad_vals[ -1 - (dim % tensor.ndim) ] = (0, pad_len - tensor.shape[ dim ])
-				pad_vals = tuple( p for tup in pad_vals for p in tup )
-				return t.nn.functional.pad( tensor, pad_vals, value = value )
+		def pad_right( tensor, dim, pad_len, value ):
+			pad_vals = [ (0, 0) ] * tensor.ndim
+			# ugly index manipulation because torch.nn.functional.pad is weird
+			pad_vals[ -1 - (dim % tensor.ndim) ] = (0, pad_len - tensor.shape[ dim ])
+			pad_vals = tuple( p for tup in pad_vals for p in tup )
+			return t.nn.functional.pad( tensor, pad_vals, value = value )
 
-			apply_pad = lambda l, d, p, v: [ pad_right( tensor, d, p, v ) for tensor in l ]
-			logs = apply_pad( logs, -2, pad_to_length, t.nan )
-			ans = apply_pad( ans, -1, pad_to_length, self.validation_pad_token )
-			logs, ans = t.cat( logs, dim = 0 ), t.cat( ans, dim = 0 )
+		apply_pad = lambda l, d, p, v: [ pad_right( tensor, d, p, v ) for tensor in l ]
+		logs = apply_pad( logs, -2, pad_to_length, t.nan )
+		ans = apply_pad( ans, -1, pad_to_length, self.validation_pad_token )
+		logs, ans = t.cat( logs, dim = 0 ), t.cat( ans, dim = 0 )
 
-			def compute_losses( l, a ):
-				l_ = einx.rearrange( "... v -> (...) v", l )
-				a_ = einx.rearrange( "... -> (...)", a )
-				losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" ).reshape_as( a )
-				losses = einx.where( "... s, , ... s", a == self.validation_pad_token, t.nan, losses )
-				return losses
+		def compute_losses( l, a ):
+			l_ = einx.rearrange( "... v -> (...) v", l )
+			a_ = einx.rearrange( "... -> (...)", a )
+			losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" ).reshape_as( a )
+			losses = einx.where( "... s, , ... s", a == self.validation_pad_token, t.nan, losses )
+			return losses
 
-			losses = compute_losses( logs, ans )
-			losses = losses.reshape_as( ans )
+		losses = compute_losses( logs, ans )
+		losses = losses.reshape_as( ans )
 
-			loss = losses.nan_to_num( 1 ).prod( dim = - 1 ).mean()
-			self.log( "val_loss", loss, prog_bar = True )
+		loss = losses.nan_to_num( 1 ).prod( dim = - 1 ).mean()
+		self.log( "val_loss", loss, prog_bar = True )
 
 
 tokenizer = AutoTokenizer.from_pretrained( "Qwen/Qwen2.5-0.5B" )
@@ -479,5 +488,6 @@ with t.profiler.profile(
 	try:
 		# trainer.fit( model, datamodule = dm )
 		trainer.validate( model, datamodule = dm )
-	finally:
+	except t.OutOfMemoryError as e:
+		print("OOM, dumping memory snapshot...", flush = True)
 		t.cuda.memory._dump_snapshot( os.path.join( trace_dir, "memory_snapshot.json" ) )
