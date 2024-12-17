@@ -4,3 +4,4 @@ peft
 lightning
 einx[torch]
 wrapt
+wandb
