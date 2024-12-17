@@ -1,19 +1,17 @@
 import os
 import time
-import warnings
 from collections import defaultdict
-from concurrent.futures import Future
 from contextlib import nullcontext
+from functools import partial
 
 import einx
 import lightning.pytorch as pl
 import torch as t
-from accelerate.utils import recursively_apply
 from peft import get_peft_model, LoraConfig
 from pytorch_lightning.loggers import WandbLogger
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, GenerationConfig, StaticCache
 
-from quiet_star.broker import TensorBroker
+from quiet_star.broker import BrokeredList
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
 from quiet_star.training.data import QuietStarDataModule
 
@@ -41,8 +39,7 @@ class QuietStar( pl.LightningModule ):
 		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
 		self.validation_pad_token = validation_pad_token
 		self.test_val_batch_size = test_val_batch_size
-		self.outputs = defaultdict( list )
-		self.brokers = {}
+		self.outputs = defaultdict( partial( BrokeredList, size = 16 ) )
 
 	def configure_model( self ):
 		self.model = self.hparams.model_factory( self.hparams.config )
@@ -75,7 +72,7 @@ class QuietStar( pl.LightningModule ):
 
 	def on_train_epoch_start( self ):
 		self.training_cache = StaticCache(
-			max_cache_len = 256 * ( 3 + self.hparams.look_ahead + self.hparams.thought_depth),
+			max_cache_len = 256 * (3 + self.hparams.look_ahead + self.hparams.thought_depth),
 			batch_size = self.hparams.train_batch_size * self.hparams.n_thoughts,
 			device = self.device,
 			dtype = self.dtype,
@@ -86,7 +83,7 @@ class QuietStar( pl.LightningModule ):
 			input_ids = batch[ "input_ids" ], labels = batch[ "input_ids" ],
 			attention_mask = batch[ "attention_mask" ], past_key_values = self.training_cache ).loss
 		self.training_cache = self.training_cache.reset()
-		if hasattr(self, "profiler"):
+		if hasattr( self, "profiler" ):
 			self.profiler.step()
 		return loss
 
@@ -115,23 +112,14 @@ class QuietStar( pl.LightningModule ):
 		logs = t.cat( [ l.unsqueeze( 0 ) for l in output.logits ], dim = 0 )
 		logs = einx.rearrange( "c ... v -> ... c v", logs )
 		batch[ "output" ] = logs
-		self.outputs[ dataloader_idx ].append( recursively_apply(self.use_broker, batch ) )
-		if hasattr(self, "profiler"):
+		self.outputs[ dataloader_idx ].append( batch )
+		if hasattr( self, "profiler" ):
 			self.profiler.step()
-
-	def use_broker( self, tensor ):
-		broker = self.brokers.get((tensor.shape, tensor.dtype), None)
-		if broker is None:
-			broker = TensorBroker( tensor.shape, tensor.dtype, 16 )
-			self.brokers[ (tensor.shape, tensor.dtype) ] = broker
-		return broker( tensor )
 
 	def on_validation_epoch_end( self ):
 		flat_outputs = [ ]
 		for lst in self.outputs.values():
 			flat_outputs.extend( lst )
-
-		flat_outputs = recursively_apply(lambda _: _.result(), flat_outputs, test_type = lambda _: isinstance(_, Future))
 
 		logs, ans = [ ], [ ]
 
@@ -215,7 +203,8 @@ dm = QuietStarDataModule(
 	n_download_proc = 1,
 )
 
-model = QuietStar( config, model_factory, validation_pad_token = tokenizer.pad_token_id, test_val_batch_size = dm.test_val_batch_size )
+model = QuietStar(
+	config, model_factory, validation_pad_token = tokenizer.pad_token_id, test_val_batch_size = dm.test_val_batch_size )
 
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
 	every_n_train_steps = 10,
@@ -226,16 +215,18 @@ run_id = int( time.time() )
 trace_dir = os.path.join( ".trace", str( run_id ) )
 os.makedirs( trace_dir, exist_ok = True )
 
+
 def trace_handler( prof ):
-	print("Saving trace...", flush = True)
+	print( "Saving trace...", flush = True )
 	st = time.process_time()
 	prof.export_chrome_trace( os.path.join( trace_dir, f"{prof.step_num}.json.gz" ) )
 	et = time.process_time()
-	print(f"Trace saved! Took {et - st:.2f} seconds", flush = True)
+	print( f"Trace saved! Took {et - st:.2f} seconds", flush = True )
+
 
 do_profile = False
 
-t.cuda.memory._record_memory_history(stacks="python")
+t.cuda.memory._record_memory_history( stacks = "python" )
 
 with t.profiler.profile(
 		activities = [
@@ -253,7 +244,7 @@ with t.profiler.profile(
 		model.profiler = prof
 
 	root_dir = "gs://ddanilovic-llm-storage"
-	logger = WandbLogger(log_model="all")
+	logger = WandbLogger( log_model = "all" )
 	logger.watch( model )
 	trainer = pl.Trainer(
 		default_root_dir = root_dir,
@@ -273,5 +264,5 @@ with t.profiler.profile(
 		# trainer.fit( model, datamodule = dm )
 		trainer.validate( model, datamodule = dm )
 	except t.OutOfMemoryError as e:
-		print("OOM, dumping memory snapshot...", flush = True)
+		print( "OOM, dumping memory snapshot...", flush = True )
 		t.cuda.memory._dump_snapshot( os.path.join( trace_dir, "memory_snapshot.json" ) )
