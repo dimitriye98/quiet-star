@@ -452,10 +452,10 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			if cache_pos is None:
 				past_seen_tokens = params.past_key_values.get_seq_length() if params.past_key_values is not None else 0
 				cache_pos = torch.arange(
-					past_seen_tokens, past_seen_tokens + input_ids.shape[-1]
+					past_seen_tokens, past_seen_tokens + input_ids.shape[ -1 ]
 				)
 			if position_ids is None:
-				position_ids = cache_pos.unsqueeze(0)
+				position_ids = cache_pos.unsqueeze( 0 )
 
 			extend = lambda f, T, l: t.cat( (T, f( (*T.shape[ :-1 ], l), dtype = T.dtype )), dim = -1 )
 			context = extend( t.empty, input_ids, self.thought_depth + 2 )
@@ -488,7 +488,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			init_cache_len = params.past_key_values.get_seq_length() if params.past_key_values is not None else None
 
 			# Get the logits and the hidden state so we can let the outputs deallocate
-			pl, ph = outputs.logits, outputs.hidden_states[ -1 ][ ..., -1, : ].clone()
+			pl, ph = outputs.logits, outputs.hidden_states[ -1 ][ ..., -1:, : ].clone()
 
 			def update_cache_pos( p ):
 				if p is not None:
@@ -520,7 +520,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				outputs = self.lm_model(
 					input_ids = inp,
 					position_ids = pos,
-					attention_mask = context_mask[..., :mask_offset + i ],
+					attention_mask = context_mask[ ..., :mask_offset + i ],
 					past_key_values = cache,
 					use_cache = params.use_cache,
 					output_attentions = False,
@@ -548,7 +548,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			outputs = self.lm_model(
 				input_ids = inp,
 				position_ids = pos,
-				attention_mask = context_mask[..., :mask_offset + i ],
+				attention_mask = context_mask[ ..., :mask_offset + i ],
 				past_key_values = cache,
 				use_cache = params.use_cache,
 				output_attentions = False,
@@ -558,11 +558,17 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				num_logits_to_keep = 1,
 			)
 
-			ql, qh = outputs.logits, outputs.hidden_states[ -1 ][ ..., -1, : ]
+			ql, qh = outputs.logits, outputs.hidden_states[ -1 ][ ..., -1:, : ]
 
 			alpha = self.mixer_head( ph, qh )
 
-			logits = pl * (1 - alpha) + ql * alpha
+			# Extremely memory intensive if we do this out of place,
+			# python isn't smart enough to optimize this on its own
+			# logits = pl * (1 - alpha) + ql * alpha
+			pl *= (1 - alpha)
+			ql *= alpha
+			pl += ql
+			logits = pl
 
 			if isinstance( params.past_key_values, DynamicCache ) or isinstance( params.past_key_values, StaticCache ):
 				self.crop_cache( params.past_key_values, init_cache_len )
