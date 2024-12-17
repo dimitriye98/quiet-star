@@ -5,7 +5,6 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Sequence, Dict
 
-import torch
 import torch as t
 import wrapt
 from dataclasses import dataclass
@@ -412,7 +411,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 	# else:
 	# 	return (logits,) + (pkv,) if (pkv := params.past_key_values) is not None else ()
 
-	@torch.no_grad()
+	@t.inference_mode()
 	def inference_forward( self, params ):
 		input_ids = params.input_ids
 		if params.inputs_embeds is not None:
@@ -451,7 +450,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			position_ids = params.position_ids
 			if cache_pos is None:
 				past_seen_tokens = params.past_key_values.get_seq_length() if params.past_key_values is not None else 0
-				cache_pos = torch.arange(
+				cache_pos = t.arange(
 					past_seen_tokens, past_seen_tokens + input_ids.shape[ -1 ]
 				)
 			if position_ids is None:
