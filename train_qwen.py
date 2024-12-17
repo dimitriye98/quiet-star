@@ -2,6 +2,7 @@ import os
 import time
 import warnings
 from collections import defaultdict
+from concurrent.futures import Future
 from contextlib import nullcontext
 
 import einx
@@ -12,7 +13,7 @@ from peft import get_peft_model, LoraConfig
 from pytorch_lightning.loggers import WandbLogger
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, GenerationConfig, StaticCache
 
-from quiet_star.broker import PinnedTensorBroker, LazyFuture
+from quiet_star.broker import TensorBroker
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
 from quiet_star.training.data import QuietStarDataModule
 
@@ -114,23 +115,23 @@ class QuietStar( pl.LightningModule ):
 		logs = t.cat( [ l.unsqueeze( 0 ) for l in output.logits ], dim = 0 )
 		logs = einx.rearrange( "c ... v -> ... c v", logs )
 		batch[ "output" ] = logs
-		self.outputs[ dataloader_idx ].append( recursively_apply(self.use_broker, batch, cm = t.inference_mode()) )
+		self.outputs[ dataloader_idx ].append( recursively_apply(self.use_broker, batch ) )
 		if hasattr(self, "profiler"):
 			self.profiler.step()
 
-	def use_broker( self, tensor, cm=None ):
+	def use_broker( self, tensor ):
 		broker = self.brokers.get((tensor.shape, tensor.dtype), None)
 		if broker is None:
-			broker = PinnedTensorBroker( tensor.shape, tensor.dtype, 16, cm=cm )
+			broker = TensorBroker( tensor.shape, tensor.dtype, 16 )
 			self.brokers[ (tensor.shape, tensor.dtype) ] = broker
-		return broker.send_to_cpu( tensor )
+		return broker( tensor )
 
 	def on_validation_epoch_end( self ):
 		flat_outputs = [ ]
 		for lst in self.outputs.values():
 			flat_outputs.extend( lst )
 
-		flat_outputs = recursively_apply(lambda _: _.result(), flat_outputs, test_type = lambda _: isinstance(_, LazyFuture))
+		flat_outputs = recursively_apply(lambda _: _.result(), flat_outputs, test_type = lambda _: isinstance(_, Future))
 
 		logs, ans = [ ], [ ]
 
