@@ -3,7 +3,7 @@ import inspect
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Sequence, Dict
+from typing import Sequence, Dict, Any
 
 import torch as t
 import wrapt
@@ -14,7 +14,7 @@ pymin = min
 pymax = max
 from einx.op import *
 from torch import Tensor, LongTensor, FloatTensor
-from torch.nn.functional import gumbel_softmax, relu, cross_entropy, pad
+from torch.nn.functional import gumbel_softmax, relu, cross_entropy, pad, binary_cross_entropy
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig, Cache, DynamicCache, StaticCache, \
 	GenerationConfig
 from transformers.activations import ACT2FN
@@ -33,20 +33,6 @@ def inherit_device_and_dtype( wrapped, instance, args, kwargs ):
 	t.set_default_dtype( old_dtype )
 	return ret
 
-
-_config_params = {
-	"thought_depth": 12,
-	"start_thought_token": None,
-	"end_thought_token": None,
-	"thought_temperature": 1.0,
-	"reinforce_temperature": 3.0,
-	"n_thoughts": 2,
-	"look_ahead": 4,
-	"base_loss_beta": 1.0,
-	"policy_loss_beta": 1e6,
-	"mixer_head_activation": "relu",
-	"mixer_head_hidden_layers": 1
-}
 
 compilation_cache = { }
 
@@ -81,6 +67,26 @@ def _compile_on_first_call( wrapped, instance, args, kwargs ):
 	raise RuntimeError( f"call function {wrapped.__name__} at {file}{line} before attempting to compile" )
 
 
+_config_params = {
+	"thought_depth": 12,
+	"start_thought_token": None,
+	"end_thought_token": None,
+	"thought_temperature": 1.0,
+	"reinforce_temperature": 3.0,
+	"n_thoughts": 2,
+	"look_ahead": 4,
+	"base_loss_beta": 1.0,
+	"policy_loss_beta": 1e6,
+	"mixer_head_activation": "relu",
+	"mixer_head_hidden_layers": 1,
+	"confidence_head_activation": "relu",
+	"confidence_head_hidden_layers": 3,
+	"confidence_loss_beta": 1e4,
+	"confidence_head_output_activation": "sigmoid",
+	"confidence_parameter": 0.0,
+}
+
+
 class ThoughtModelConfig( PretrainedConfig, ABC ):
 
 	def __init__( self, **kwargs ):
@@ -89,6 +95,7 @@ class ThoughtModelConfig( PretrainedConfig, ABC ):
 			val = kwargs.pop( k, v )
 			setattr( self, k, val )
 		self.mixer_head_hidden_size = kwargs.pop( "mixer_head_hidden_size", self.hidden_size )
+		self.confidence_head_hidden_size = kwargs.pop( "confidence_head_hidden_size", self.hidden_size )
 		self.initial_start_thought_token = kwargs.pop( "initial_start_thought_token", None )
 		self.initial_end_thought_token = kwargs.pop( "initial_end_thought_token", None )
 
@@ -106,6 +113,42 @@ class WeightedMixerHead( t.nn.Module ):
 	def forward( self, pre_thought_hidden_state, post_thought_hidden_state ):
 		catted_states = t.cat( (pre_thought_hidden_state, post_thought_hidden_state), dim = -1 )
 		return self.mlp( catted_states )
+
+
+class ConfidenceHead( t.nn.Module ):
+	def __init__( self, config ):
+		super().__init__()
+		hs, ms, nl = config.hidden_size, config.confidence_head_hidden_size, config.confidence_head_hidden_layers
+		input_layer = [ t.nn.Linear( 2 * hs + 1, ms ) ]
+		mid_layer = [ t.nn.Linear( ms, ms ), ACT2FN[ config.confidence_head_activation ] ] * nl
+		output_layer = [ ACT2FN[ config.confidence_head_activation ], t.nn.Linear( ms, 1 ),
+			ACT2FN[ config.confidence_head_output_activation ] ]
+
+		self.mlp = t.nn.Sequential( *input_layer, *mid_layer, *output_layer )
+
+	def forward( self, pre_thought_hidden_state, post_thought_hidden_state, mixer_value ):
+		catted_states = t.cat( (pre_thought_hidden_state, post_thought_hidden_state, mixer_value), dim = -1 )
+		return self.mlp( catted_states )
+
+
+def crop_cache( cache: Cache, l: int ):
+	if isinstance( cache, DynamicCache ):
+		cache.crop( l )
+	elif isinstance( cache, StaticCache ):
+		# Relies on unexposed internals, might break if they change
+		for layer_idx in range( len( cache.key_cache ) ):
+			if cache.key_cache[ layer_idx ] is not None:
+				cache.key_cache[ layer_idx ][ :, :, l + 1: ].zero_()
+			if cache.value_cache[ layer_idx ] is not None:
+				cache.value_cache[ layer_idx ][ :, :, l + 1: ].zero_()
+	else:
+		raise NotImplementedError( "Only DynamicCache and StaticCache are currently supported" )
+
+
+@dataclass
+class ThoughtfulLMOutputWithPast( CausalLMOutputWithPast ):
+	thoughts: Tensor = None
+	logits_without_confidence: Tensor = None
 
 
 class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
@@ -136,6 +179,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		self.base_loss_beta = config.base_loss_beta
 		self.policy_loss_beta = config.policy_loss_beta
 		self.mixer_head = WeightedMixerHead( config )
+		self.confidence_head = ConfidenceHead( config )
+		self.confidence_loss_beta = config.confidence_loss_beta
+		self.confidence_parameter = config.confidence_parameter
 
 	@property
 	@abstractmethod
@@ -155,25 +201,14 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		output_hidden_states: Optional[ bool ] = None
 		return_dict: Optional[ bool ] = None
 		cache_position: Optional[ LongTensor ] = None
-		num_logits_to_keep: int = None
+		num_logits_to_keep: Optional[ int ] = None
 		thought_mask: Optional[ Tensor ] = None
+		confidence_parameter: Optional[ float ] = None
+		cached_thoughts: Optional[ Tensor ] = None
+		comparison_mode: bool = False
 
 		def as_kwargs( self ):
 			return { f.name: getattr( self, f.name ) for f in dataclasses.fields( self ) }
-
-	@staticmethod
-	def crop_cache( cache: Cache, l: int ):
-		if isinstance( cache, DynamicCache ):
-			cache.crop( l )
-		elif isinstance( cache, StaticCache ):
-			# Relies on unexposed internals, might break if they change
-			for layer_idx in range( len( cache.key_cache ) ):
-				if cache.key_cache[ layer_idx ] is not None:
-					cache.key_cache[ layer_idx ][ :, :, l + 1: ].zero_()
-				if cache.value_cache[ layer_idx ] is not None:
-					cache.value_cache[ layer_idx ][ :, :, l + 1: ].zero_()
-		else:
-			raise NotImplementedError( "Only DynamicCache and StaticCache are currently supported" )
 
 	def prepare_inputs_for_generation(
 			self,
@@ -183,11 +218,32 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			inputs_embeds: Optional[ FloatTensor ] = None,
 			cache_position: Optional[ LongTensor ] = None,
 			num_logits_to_keep: int = 1,
+			confidence_parameter: Optional[ float ] = None,
+			comparison_mode: bool = False,
 			**kwargs,
 	):
 		return super().prepare_inputs_for_generation(
-			input_ids, past_key_values, attention_mask, inputs_embeds, cache_position,
-			num_logits_to_keep = num_logits_to_keep, **kwargs )
+			input_ids,
+			past_key_values,
+			attention_mask,
+			inputs_embeds,
+			cache_position,
+			num_logits_to_keep = num_logits_to_keep,
+			confidence_parameter = confidence_parameter,
+			comparison_mode = comparison_mode,
+			**kwargs )
+
+	def _update_model_kwargs_for_generation(
+			self,
+			outputs: ThoughtfulLMOutputWithPast,
+			model_kwargs: Dict[ str, Any ],
+			is_encoder_decoder: bool = False,
+			num_new_tokens: int = 1,
+	) -> Dict[ str, Any ]:
+		ret = super()._update_model_kwargs_for_generation(
+			outputs, model_kwargs, is_encoder_decoder, num_new_tokens )
+		ret[ "cached_thoughts" ] = outputs.thoughts
+		return ret
 
 	@t.inference_mode()
 	def inference_forward( self, params ):
@@ -262,6 +318,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			)
 
 			context[ ..., offset ] = self.start_thought_token
+			context[ ..., offset + self.thought_depth + 1 ] = self.end_thought_token
+
 			init_cache_len = params.past_key_values.get_seq_length() if params.past_key_values is not None else None
 
 			# Get the logits and the hidden state so we can let the outputs deallocate
@@ -273,14 +331,67 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 
 			cache_pos = update_cache_pos( cache_pos )
 
+			if params.confidence_parameter is None:
+				params.confidence_parameter = self.confidence_parameter
+
+			confidence = None
+			if params.cached_thoughts is not None and params.confidence_parameter > 0:
+				context[ ..., offset + 1: offset + self.thought_depth + 1 ] = params.cached_thoughts
+
+				test_pass_cache_pos = cache_pos[ ..., -1: ] + t.arange( 0, self.thought_depth + 2 )
+
+				# Do a pass through the model to get the logits and hidden states with the cached thought
+				outputs = self.lm_model(
+					input_ids = context[ ..., 1:offset + self.thought_depth + 2 ],
+					position_ids = context_position_ids[ ..., 1:offset + self.thought_depth + 2 ],
+					attention_mask = context_mask[ ..., :mask_offset + self.thought_depth + 2 ],
+					past_key_values = params.past_key_values,
+					use_cache = params.use_cache,
+					output_attentions = False,
+					output_hidden_states = True,
+					return_dict = True,
+					cache_position = test_pass_cache_pos,
+					num_logits_to_keep = 1,
+				)
+				qcl, qch = outputs.logits, outputs.hidden_states[ -1 ][ ..., -1:, : ]
+
+				pre_mix = self.mixer_head( ph, qch )
+				confidence = self.confidence_head( ph, qch, pre_mix ).ge( params.confidence_parameter ).to( self.dtype )
+				assert confidence.shape[ -1 ] == 1
+
+				# if confidence.all() and not params.comparison_mode:
+				# 	# We're done (really only relevant for unbatched inference, but who knows)
+				# 	# Crop the cache to initial length, and return outputs
+				# 	crop_cache( params.past_key_values, init_cache_len )
+				# 	return ThoughtfulLMOutputWithPast(
+				# 		logits = pl,
+				# 		past_key_values = outputs.past_key_values,
+				# 		thoughts = params.cached_thoughts
+				# 	)
+
+				if not params.comparison_mode:
+					raise NotImplementedError( "Only comparison mode is currently supported" )
+
+				qcl *= pre_mix
+				confident_logits = qcl + pl * (1 - pre_mix)
+
+				# Crop the cache for regeneration
+				if isinstance( params.past_key_values, DynamicCache ) or isinstance(
+						params.past_key_values, StaticCache ):
+					crop_cache( params.past_key_values, init_cache_len )
+				else:
+					warnings.warn(
+						f"Cache is of unsupported type {type( params.past_key_values )} and can't be cropped, falling back to invalidating it instead" )
+					params.past_key_values = None
+
 			def sample( logits ):
 				logits[ ..., self.start_thought_token ] = -t.inf
 				logits[ ..., self.end_thought_token ] = -t.inf
 				if self.thought_temperature == 0.0:
-					tok = logits[ ..., 0 ].argmax( dim = -1 )
+					tok = logits[ ..., 0, : ].argmax( dim = -1 )
 				else:
 					tok = gumbel_softmax(
-						logits[ ..., 0 ],
+						logits[ ..., 0, : ],
 						tau = self.thought_temperature,
 						hard = True ).argmax( dim = -1 )
 
@@ -310,9 +421,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				context[ ..., offset + i ] = sample( outputs.logits )
 				cache_pos = update_cache_pos( cache_pos )
 
-			i += 1
-			context[ ..., offset + i ] = self.end_thought_token
-			i += 1
+			i += 2
 
 			if cache_pos is not None:
 				cache_pos = t.cat( (cache_pos, cache_pos[ ..., -1: ] + 1), dim = -1 )
@@ -346,18 +455,28 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			ql *= alpha
 			pl += ql
 			logits = pl
+			logits_without_confidence = logits
 
 			if isinstance( params.past_key_values, DynamicCache ) or isinstance( params.past_key_values, StaticCache ):
-				self.crop_cache( params.past_key_values, init_cache_len )
+				crop_cache( params.past_key_values, init_cache_len )
 			else:
 				warnings.warn(
 					f"Cache is of unsupported type {type( params.past_key_values )} and can't be cropped, falling back to invalidating it instead" )
 				params.past_key_values = None
 
+			if confidence is not None:
+				# Reincorporate the confident logits
+				# Remember that we discretized confidence to 0 or 1
+				logits *= 1 - confidence
+				confident_logits *= confidence
+				logits += confident_logits
+
 			if params.return_dict:
-				return CausalLMOutputWithPast(
+				return ThoughtfulLMOutputWithPast(
 					logits = logits,
+					logits_without_confidence = logits_without_confidence,
 					past_key_values = outputs.past_key_values,
+					thoughts = context[ ..., -self.thought_depth - 1:-1 ]
 				)
 			else:
 				return (logits,) + ((pkv,) if (pkv := outputs.past_key_values) is not None else tuple())
@@ -374,6 +493,20 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		@property
 		def n( self ):
 			return self._n
+
+		def mutate_for_confidence( self, ett_idx ):
+			# Shift all thoughts by one
+			self[ 0:ett_idx ][ ..., 1: ] = self[ 0:ett_idx ][ ..., :-1 ]
+
+			# Invalidate the cache down to the start thought token layer and adjust the cache pointers
+			if self._params.past_key_values is not None:
+				crop_cache( self._params.past_key_values, 2 * self._l )
+				self._new_lower = 1
+				self._new_upper = 1
+
+			# Invalidate all tokens and logits after the end thought token
+			self._logit_layers[ ett_idx + 1: ] = False
+			self._token_layers[ ett_idx + 1: ] = False
 
 		def __init__(
 				self,
@@ -480,13 +613,13 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				i += 1
 				assert i < layer
 
-			assert self._new_lower < self._new_upper
-
 			# While we could process in parallel here in some cases, an increase
 			# in batch size would be roughly equivalent, and easier to implement
 			# so long as we're not memory constrained. Something to consider
 			# if the GPU isn't saturated but VRAM is.
 			upper = pymin( self._new_upper, layer )
+
+			assert self._new_lower <= upper
 
 			tm = self.thought_mask[ self._new_lower:upper, : ]
 
@@ -611,13 +744,13 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		pass
 
 	@staticmethod
-	def compute_cross_entropy_loss( logits, targets, *, mask = None, temperature = 0.0 ):
+	def compute_cross_entropy_loss( logits, targets, *, mask = None, temperature = 0.0, loss_fn = cross_entropy ):
 		if temperature != 0.0:
 			logits = logits / temperature
 
 		# loss = vmap( "... [l v], ... [l] -> ... [l]", logits, targets, op = cross_entropy, kwargs = { "reduction": "none" } )
 		l, tg = rearrange( "... l v, ... l -> (... l) v, (... l)", logits, targets )
-		ls = cross_entropy( l, tg, reduction = "none" )
+		ls = loss_fn( l, tg, reduction = "none" )
 		loss = rearrange( "(B... l) -> B... l", ls, **solve( "B... l", targets ) )
 
 		if mask is not None:
@@ -703,26 +836,49 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			base_loss, logits_thought[ ..., :-self.look_ahead, : ], targets_thought[ ..., :-self.look_ahead ],
 			temperature = self.reinforce_temperature )
 
-		losses = (("base_loss", base_loss, self.base_loss_beta), ("policy_loss", policy_loss, self.policy_loss_beta))
+		del ql, qh
+		ts.mutate_for_confidence( self.thought_depth + 2 )
+		qch = [ ], [ ]
+		for i in range( self.look_ahead ):
+			j = i + self.thought_depth + 3
+			ts.logits[ j ]
+			qch.append( ts.hidden_states[ j ] )
+			ts[ j ] = padded_labels[ ..., i, : ]
 
-		callback_result = self._loss_callback(
-			thought_state = ts,
-			targets_loss = targets_loss,
-			targets_thought = targets_thought,
-			pl = pl,
-			ph = ph,
-			ql = ql,
-			qh = qh,
-			alpha = alpha,
-			mask = sliding_mask )
+		false_alpha = self.mixer_head( ph, qch )
+		confidence = self.confidence_head( ph, qch, false_alpha )
+		sliding_mask[ ..., 0 ] = 0  # Mask out the thought from the first token
+		with t.no_grad():
+			# Intentionally break the gradients to enforce causality
+			targets_confidence = false_alpha.ge( alpha ).to( self.dtype )
 
-		if callback_result is not None:
-			additional_losses, additional_metrics = callback_result
-		else:
-			additional_losses, additional_metrics = (), ()
+		confidence_loss = binary_cross_entropy( confidence, targets_confidence, reduction = "none" )
+		confidence_loss.masked_fill_( ~(sliding_mask.to( t.bool )), t.nan )
+		confidence_loss.nanmean( dim = -1 )
 
-		if callback_result is not None:
-			losses = tuple( losses ) + tuple( additional_losses )
+		losses = (
+			("base_loss", base_loss, self.base_loss_beta),
+			("policy_loss", policy_loss, self.policy_loss_beta),
+			("confidence_loss", confidence_loss, self.confidence_loss_beta))
+
+		# callback_result = self._loss_callback(
+		# 	thought_state = ts,
+		# 	targets_loss = targets_loss,
+		# 	targets_thought = targets_thought,
+		# 	pl = pl,
+		# 	ph = ph,
+		# 	ql = ql,
+		# 	qh = qh,
+		# 	alpha = alpha,
+		# 	mask = sliding_mask )
+		#
+		# if callback_result is not None:
+		# 	additional_losses, additional_metrics = callback_result
+		# else:
+		# 	additional_losses, additional_metrics = (), ()
+		#
+		# if callback_result is not None:
+		# 	losses = tuple( losses ) + tuple( additional_losses )
 
 		aggregate_loss = None
 		for _, loss, beta in losses:
@@ -746,7 +902,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				if policy_metrics is not None:
 					metrics_to_log += policy_metrics
 
-				metrics_to_log += additional_metrics
+				# metrics_to_log += additional_metrics
 
 				metrics_to_log += tuple( (name, loss) for name, loss, _ in losses )
 

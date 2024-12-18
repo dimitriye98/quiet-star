@@ -77,7 +77,7 @@ class QuietStarDataModule( pl.LightningDataModule ):
 			self,
 			tokenizer,
 			train_batch_size = 2,
-			test_val_batch_size = 1024,
+			test_val_batch_size = 512,
 			preproc_batch_size = 1024,
 			gsm8k_ans_len = 15,
 			csqa_ans_len = 5,

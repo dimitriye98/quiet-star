@@ -36,6 +36,9 @@ class QuietStar( pl.LightningModule ):
 			look_ahead = 4,
 			n_thoughts = 2,
 			thought_depth = 12,
+			confidence_loss_beta_step_up = 1e3,
+			confidence_loss_beta_step_up_start = 2000,
+			confidence_loss_beta_step_up_end = 3000,
 			**kwargs ):
 		super().__init__()
 		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
@@ -44,6 +47,7 @@ class QuietStar( pl.LightningModule ):
 		self.broker = CollectionBroker( 1073741824 )
 		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
 		self.outputs = defaultdict( list )
+		self.initial_confidence_loss_beta = config.confidence_loss_beta
 
 	def __del__( self ):
 		self.evaluation_pool.shutdown( wait = False, cancel_futures = True )
@@ -86,6 +90,10 @@ class QuietStar( pl.LightningModule ):
 			config = self.model.config )
 
 	def training_step( self, batch, batch_idx ):
+		if self.hparams.confidence_loss_beta_step_up_start < self.current_epoch <= self.hparams.confidence_loss_beta_step_up_end:
+			lerp = self.current_epoch - self.hparams.confidence_loss_beta_step_up_start / ( self.hparams.confidence_loss_beta_step_up_end - self.hparams.confidence_loss_beta_step_up_start )
+			# Linear ramp from start to end
+			self.model.confidence_loss_beta = self.initial_confidence_loss_beta * ( 1 - lerp ) + (self.hparams.confidence_loss_beta_step_up * self.initial_confidence_loss_beta) * lerp
 		loss = self.model(
 			input_ids = batch[ "input_ids" ], labels = batch[ "input_ids" ],
 			attention_mask = batch[ "attention_mask" ], past_key_values = self.training_cache ).loss
@@ -111,15 +119,26 @@ class QuietStar( pl.LightningModule ):
 		return self._validation_gen_config
 
 	def validation_step( self, batch, batch_idx, dataloader_idx = 0 ):
-		output = self.model.generate(
+		output_sans_confidence = self.model.generate(
 			inputs = batch[ "input_ids" ],
 			attention_mask = batch[ "attention_mask" ],
 			generation_config = self.validation_gen_config,
 			max_new_tokens = batch[ "answer" ].shape[ -1 ] )
-		logs = t.cat( [ l.unsqueeze( 0 ) for l in output.logits ], dim = 0 )
-		logs = einx.rearrange( "c ... v -> ... c v", logs )
-		batch[ "output_ids" ] = output.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
-		batch[ "output_logits" ] = logs
+		output_with_confidence = self.model.generate(
+			inputs = batch[ "input_ids" ],
+			attention_mask = batch[ "attention_mask" ],
+			generation_config = self.validation_gen_config,
+			max_new_tokens = batch[ "answer" ].shape[ -1 ],
+			confidence_parameter = 0.7, comparison_mode = True )
+
+		logs_sc = t.cat( [ l.unsqueeze( 0 ) for l in output_sans_confidence.logits ], dim = 0 )
+		logs_wc = t.cat( [ l.unsqueeze( 0 ) for l in output_with_confidence.logits ], dim = 0 )
+		logs_sc = einx.rearrange( "c ... v -> ... c v", logs_sc )
+		logs_wc = einx.rearrange( "c ... v -> ... c v", logs_wc )
+		batch[ "output_ids" ] = output_sans_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
+		batch["confident_output_ids"] = output_with_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
+		batch[ "output_logits" ] = logs_sc
+		batch[ "confident_output_logits" ] = logs_wc
 		future = self.broker( batch )
 		future.add_done_callback( partial( self.submit_for_eval, dataloader_idx ) )
 		if hasattr( self, "profiler" ):
@@ -143,8 +162,10 @@ class QuietStar( pl.LightningModule ):
 			return ((s == a) | (a == pad_token)).all( dim = -1 ).to( t.float32 )
 
 		return {
-			"loss": compute_losses( batch[ "output_logits" ], batch[ "answer" ] ),
-			"one-shot accuracy": check_accuracy( batch[ "output_ids" ], batch[ "answer" ] ),
+			"loss (no confidence)": compute_losses( batch[ "output_logits" ], batch[ "answer" ] ),
+			"one-shot accuracy (no confidence)": check_accuracy( batch[ "output_ids" ], batch[ "answer" ] ),
+			"loss (with confidence)": compute_losses( batch[ "confident_output_logits" ], batch[ "answer" ] ),
+			"one-shot accuracy (with confidence)": check_accuracy( batch[ "confident_output_ids" ], batch[ "answer" ] ),
 		}
 
 	def on_validation_epoch_end( self ):
@@ -165,7 +186,7 @@ tokenizer.padding_side = "left"
 tokenizer.add_special_tokens( { "additional_special_tokens": [ "<|startthought|>", "<|endthought|>" ] } )
 
 config = QwenThoughtModelConfig.from_pretrained(
-	"Qwen/Qwen2.5-3B",
+	"Qwen/Qwen2.5-0.5B",
 	start_thought_token = tokenizer.convert_tokens_to_ids( "<|startthought|>" ),
 	end_thought_token = tokenizer.convert_tokens_to_ids( "<|endthought|>" ),
 	initial_start_thought_token = tokenizer.convert_tokens_to_ids( "---" ),
@@ -184,7 +205,7 @@ def model_factory( config ):
 		target_modules = "all-linear",
 	)
 
-	model = QwenThoughtModel.from_pretrained( "Qwen/Qwen2.5-3B", config = config )
+	model = QwenThoughtModel.from_pretrained( "Qwen/Qwen2.5-0.5B", config = config )
 
 	# Fix a bug with the underlying model
 	model._lm_model.resize_token_embeddings( len( tokenizer ) )
