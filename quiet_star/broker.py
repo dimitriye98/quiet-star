@@ -21,49 +21,29 @@ class Broker( metaclass = ABCMeta ):
 		pass
 
 
-class _ChoppingTensorBroker( Broker ):
-	def __init__( self, length, dtype, size ):
+class TensorBroker( Broker ):
+	def __init__( self, size = None ):
+		if size is None:
+			size = 16
 		self.pool = ThreadPoolExecutor( max_workers = size )
-		self._idle_tensors = SimpleQueue()
-		self.dtype = dtype
-		bytes_per_elem = t.tensor( [ ], dtype = dtype ).element_size()
-		self._length = length // bytes_per_elem
-
-		self.pool.submit( self.__create_target_tensors, size )
-
-	def __create_target_tensors( self, n ):
-		with t.inference_mode():
-			for i in range( n ):
-				self._idle_tensors.put(
-					t.empty(
-						self._length, dtype = self.dtype, device = t.device( "cpu" ),
-						requires_grad = False ).pin_memory() )
 
 	@t.inference_mode()
 	def __send_to_cpu( self, tensor, pin_memory = False ):
-		target = self._idle_tensors.get()
-		try:
-			stream = t.cuda.Stream()
-			with t.cuda.stream( stream ):
-				flat = tensor.view( -1 )
-				shape = tensor.shape
-				# del tensor
-				n_full = flat.shape[ 0 ] // self._length
-				rem = flat.shape[ 0 ] % self._length
-				receive = t.empty( flat.shape[ 0 ], dtype = self.dtype, device = t.device( "cpu" ), pin_memory = pin_memory )
-				for i in range( n_full ):
-					target.copy_( flat[ i * self._length: (i + 1) * self._length ] )
-					receive[ i * self._length: (i + 1) * self._length ].copy_( target )
-				if rem > 0:
-					target[ :rem ].copy_( flat[ -rem: ] )
-					receive[ -rem: ].copy_( target[ :rem ] )
-				return receive.view( shape )
-		finally:
-			self._idle_tensors.put( target )
+		stream = t.cuda.Stream()
+		with t.cuda.stream( stream ):
+			receive = t.empty( tensor.shape, dtype = tensor.dtype, device = "cpu", pin_memory = True )
+			receive.copy_( tensor )
+			# We have to copy again, as the receiving tensor *must* be pinned
+			# for the transfer to not block the GPU
+			# however, holding pinned memory can be expensive,
+			# so we only keep the data in pinned memory if instructed
+			if not pin_memory:
+				unpinned = t.empty( tensor.shape, dtype = tensor.dtype, device = "cpu" )
+				unpinned.copy_( receive )
+				return unpinned
+			return receive
 
 	def __call__( self, tensor, pin_memory = False ):
-		assert self.dtype == tensor.dtype
-
 		ret = self.pool.submit( self.__send_to_cpu, tensor.contiguous(), pin_memory = pin_memory )
 		return ret
 
@@ -71,24 +51,9 @@ class _ChoppingTensorBroker( Broker ):
 		self.pool.shutdown()
 
 
-# TODO: Implement this more efficiently, e.g. using an LRU cache of target tensors
-class TensorBroker( Broker ):
-	def __init__( self, chop = 104857600 ):
-		self._size = 2
-		self._chop = chop
-		self._subbrokers = { }
-
-	def __call__( self, tensor, pin_memory = False ):
-		if not (subbroker := self._subbrokers.get( tensor.dtype, None )):
-			logger.log( logging.INFO, f"Creating subbroker for tensors of dtype {tensor.dtype}" )
-			subbroker = _ChoppingTensorBroker( self._chop, tensor.dtype, self._size )
-			self._subbrokers[ tensor.dtype ] = subbroker
-		return subbroker( tensor, pin_memory )
-
-
 class CollectionBroker( Broker ):
-	def __init__( self, chop ):
-		self._tensor_broker = TensorBroker( chop )
+	def __init__( self, ):
+		self._tensor_broker = TensorBroker()
 
 	def __call__( self, tensors, pin_memory = False ):
 		return ft.collect( apply_to_collection( tensors, t.Tensor, partial(self._tensor_broker, pin_memory = pin_memory) ) )

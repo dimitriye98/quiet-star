@@ -46,7 +46,7 @@ class QuietStar( pl.LightningModule ):
 		super().__init__()
 		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
 		self.validation_pad_token = validation_pad_token
-		self.broker = CollectionBroker( 1073741824 )
+		self.broker = CollectionBroker()
 		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
 		self.outputs = defaultdict( list )
 		self.initial_confidence_loss_beta = config.confidence_loss_beta
@@ -251,9 +251,14 @@ def model_factory( config ):
 	return model
 
 
+effective_batch_size = 8
+acc_grad = 8
+assert effective_batch_size % acc_grad == 0
+
 dm = QuietStarDataModule(
 	tokenizer,
 	n_download_proc = 16,
+	train_batch_size = effective_batch_size // acc_grad,
 )
 
 model = QuietStar(
@@ -312,7 +317,7 @@ with t.profiler.profile(
 		val_check_interval = 250,
 		# accelerator = "auto",
 		# devices = 1,
-		accumulate_grad_batches = 4,
+		accumulate_grad_batches = acc_grad,
 		callbacks = [ checkpoint_callback ],
 		# enable_progress_bar = False,
 	)
