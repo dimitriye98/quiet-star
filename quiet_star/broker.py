@@ -2,6 +2,7 @@ import logging
 from abc import ABCMeta, abstractmethod
 from collections.abc import MutableSequence
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from operator import methodcaller
 from queue import SimpleQueue
 
@@ -9,13 +10,14 @@ import torch as t
 from lightning_utilities import apply_to_collection
 
 from . import futures as ft
+from .training.data import uncurry
 
 logger = logging.getLogger( __name__ )
 
 
 class Broker( metaclass = ABCMeta ):
 	@abstractmethod
-	def __call__( self, obj ):
+	def __call__( self, obj, pin_memory = False ):
 		pass
 
 
@@ -38,7 +40,7 @@ class _ChoppingTensorBroker( Broker ):
 						requires_grad = False ).pin_memory() )
 
 	@t.inference_mode()
-	def __send_to_cpu( self, tensor ):
+	def __send_to_cpu( self, tensor, pin_memory = False ):
 		target = self._idle_tensors.get()
 		try:
 			stream = t.cuda.Stream()
@@ -48,7 +50,7 @@ class _ChoppingTensorBroker( Broker ):
 				# del tensor
 				n_full = flat.shape[ 0 ] // self._length
 				rem = flat.shape[ 0 ] % self._length
-				receive = t.empty( flat.shape[ 0 ], dtype = self.dtype, device = t.device( "cpu" ) )
+				receive = t.empty( flat.shape[ 0 ], dtype = self.dtype, device = t.device( "cpu" ), pin_memory = pin_memory )
 				for i in range( n_full ):
 					target.copy_( flat[ i * self._length: (i + 1) * self._length ] )
 					receive[ i * self._length: (i + 1) * self._length ].copy_( target )
@@ -59,53 +61,10 @@ class _ChoppingTensorBroker( Broker ):
 		finally:
 			self._idle_tensors.put( target )
 
-	def __call__( self, tensor ):
+	def __call__( self, tensor, pin_memory = False ):
 		assert self.dtype == tensor.dtype
 
-		ret = self.pool.submit( self.__send_to_cpu, tensor )
-		return ret
-
-	def __del__( self ):
-		self.pool.shutdown()
-
-
-class _MonotypeTensorBroker( Broker ):
-	@property
-	def dtype( self ):
-		return self._dtype
-
-	def __init__( self, numel, dtype, size ):
-		self.pool = ThreadPoolExecutor( max_workers = size )
-		self._idle_tensors = SimpleQueue()
-		self._dtype = dtype
-		self._numel = numel
-
-		self.pool.submit( self.__create_target_tensors, size )
-
-	def __create_target_tensors( self, n ):
-		with t.inference_mode():
-			for i in range( n ):
-				self._idle_tensors.put(
-					t.empty(
-						self._numel, dtype = self._dtype, device = t.device( "cpu" ),
-						requires_grad = False ).pin_memory() )
-
-	@t.inference_mode()
-	def __send_to_cpu( self, tensor ):
-		target = self._idle_tensors.get()
-		try:
-			stream = t.cuda.Stream()
-			with t.cuda.stream( stream ):
-				target.copy_( tensor.reshape_as( target ) )
-			return target.clone().reshape( tensor.shape )
-		finally:
-			self._idle_tensors.put( target )
-
-	def __call__( self, tensor ):
-		assert self.dtype == tensor.dtype
-		assert self._numel == tensor.numel()
-
-		ret = self.pool.submit( self.__send_to_cpu, tensor )
+		ret = self.pool.submit( self.__send_to_cpu, tensor.contiguous(), pin_memory = pin_memory )
 		return ret
 
 	def __del__( self ):
@@ -119,20 +78,20 @@ class TensorBroker( Broker ):
 		self._chop = chop
 		self._subbrokers = { }
 
-	def __call__( self, tensor ):
+	def __call__( self, tensor, pin_memory = False ):
 		if not (subbroker := self._subbrokers.get( tensor.dtype, None )):
 			logger.log( logging.INFO, f"Creating subbroker for tensors of dtype {tensor.dtype}" )
 			subbroker = _ChoppingTensorBroker( self._chop, tensor.dtype, self._size )
 			self._subbrokers[ tensor.dtype ] = subbroker
-		return subbroker( tensor )
+		return subbroker( tensor, pin_memory )
 
 
 class CollectionBroker( Broker ):
 	def __init__( self, chop ):
 		self._tensor_broker = TensorBroker( chop )
 
-	def __call__( self, tensors ):
-		return ft.collect( apply_to_collection( tensors, t.Tensor, self._tensor_broker ) )
+	def __call__( self, tensors, pin_memory = False ):
+		return ft.collect( apply_to_collection( tensors, t.Tensor, partial(self._tensor_broker, pin_memory = pin_memory) ) )
 
 
 class BrokeredList( MutableSequence ):
@@ -160,3 +119,13 @@ class BrokeredList( MutableSequence ):
 
 	def __len__( self ):
 		return len( self.futures )
+
+def brokered_saved_tensor_hook(broker, pin_memory = False):
+	def pack_to_cpu(tensor: t.Tensor):
+		return tensor.device, broker(tensor, pin_memory)
+
+	@uncurry
+	def unpack_from_cpu(device, f_tensor):
+		return f_tensor.result().to(device)
+
+	return t.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_from_cpu)

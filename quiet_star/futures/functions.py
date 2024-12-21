@@ -1,21 +1,14 @@
 from concurrent.futures import Future
-from operator import attrgetter
-
-from toolz.curried import do, compose_left
-
-__all__ = [ ]
 
 from .collected import CollectedFuture
 
-_export = do( compose_left( attrgetter( "__name__" ), __all__.append ) )
+__all__ = [ "collect", "zip", "map" ]
 
 
-@_export
 def collect( col ):
 	return CollectedFuture( col )
 
 
-@_export
 def zip( *futures ):
 	return CollectedFuture( futures )
 
@@ -34,7 +27,6 @@ class _MapCb( object ):
 			self.target.set_result( self.op( future.result() ) )
 
 
-@_export
 def map( fn, future ):
 	ret = Future()
 	future.add_done_callback( _MapCb( ret, fn ) )
