@@ -1,13 +1,14 @@
 import os
 from abc import ABCMeta, abstractmethod
 from collections.abc import MutableSequence
-from concurrent import futures
-from concurrent.futures import ThreadPoolExecutor, Future, CancelledError
+from concurrent.futures import ThreadPoolExecutor
 from operator import methodcaller
 from queue import SimpleQueue
 
 import torch as t
 from lightning_utilities import apply_to_collection
+
+from . import futures as ft
 
 
 class Broker( metaclass = ABCMeta ):
@@ -40,7 +41,9 @@ class _ChoppingTensorBroker( Broker ):
 		try:
 			stream = t.cuda.Stream()
 			with t.cuda.stream( stream ):
-				flat = tensor.reshape( -1 )
+				flat = tensor.view( -1 )
+				shape = tensor.shape
+				# del tensor
 				n_full = flat.shape[ 0 ] // self._length
 				rem = flat.shape[ 0 ] % self._length
 				receive = t.empty( flat.shape[ 0 ], dtype = self.dtype, device = t.device( "cpu" ) )
@@ -50,7 +53,7 @@ class _ChoppingTensorBroker( Broker ):
 				if rem > 0:
 					target[ :rem ].copy_( flat[ -rem: ] )
 					receive[ -rem: ].copy_( target[ :rem ] )
-				return receive.reshape_as( tensor )
+				return receive.view( shape )
 		finally:
 			self._idle_tensors.put( target )
 
@@ -110,7 +113,7 @@ class _MonotypeTensorBroker( Broker ):
 # TODO: Implement this more efficiently, e.g. using an LRU cache of target tensors
 class TensorBroker( Broker ):
 	def __init__( self, chop = 104857600 ):
-		self._size = 1
+		self._size = 2
 		self._chop = chop
 		self._subbrokers = { }
 
@@ -127,120 +130,7 @@ class CollectionBroker( Broker ):
 		self._tensor_broker = TensorBroker( chop )
 
 	def __call__( self, tensors ):
-		return CollectedFuture( apply_to_collection( tensors, t.Tensor, self._tensor_broker ) )
-
-
-class Present:
-	__slots__ = ( "_result", "_exception", "_cancelled" )
-
-	def __init__( self, future ):
-		self._result = None
-		self._exception = None
-		self._cancelled = False
-		try:
-			self._result = future.result()
-		except Exception as e:
-			if isinstance( e, CancelledError ):
-				self._cancelled = True
-			self._exception = e
-
-	def cancel( self ):
-		return self._cancelled
-
-	def cancelled( self ):
-		return self._cancelled
-
-	def running( self ):
-		return False
-
-	def done( self ):
-		return self._result is not None
-
-	def result( self, timeout = None ):
-		if self._exception is not None:
-			raise self._exception
-		return self._result
-
-	def exception( self, timeout = None ):
-		if isinstance( self._exception, CancelledError ):
-			raise self._exception
-		return self._exception
-
-	def add_done_callback( self, callback ):
-		try:
-			callback( self )
-		except Exception:
-			futures._base.LOGGER.exception( 'exception calling callback for %r', self )
-
-
-class CollectedFuture:
-	def __init__( self, collection ):
-		self._collection = collection
-		self._done_callbacks = None
-		self._n_done = 0
-		self._n_futures = 0
-		apply_to_collection( self._collection, Future, self._inc )
-
-	def _inc( self, f ):
-		self._n_futures += 1
-
-	def _collect_op_all( self, op ):
-		retval = False
-
-		def impl( f ):
-			nonlocal retval
-			retval &= op( f )
-
-		apply_to_collection( self._collection, Future, impl )
-		return retval
-
-	def _collect_op_any( self, op ):
-		retval = False
-
-		def impl( f ):
-			nonlocal retval
-			retval |= op( f )
-
-		apply_to_collection( self._collection, Future, impl )
-		return retval
-
-	def cancel( self ):
-		return self._collect_op_all( methodcaller( "cancel" ) )
-
-	def cancelled( self ):
-		return self._collect_op_all( methodcaller( "cancelled" ) )
-
-	def running( self ):
-		return self._collect_op_any( methodcaller( "running" ) )
-
-	def done( self ):
-		return self._collect_op_all( methodcaller( "done" ) )
-
-	def result( self, timeout = None ):
-		return apply_to_collection( self._collection, Future, methodcaller( "result", timeout ) )
-
-	def exception( self, timeout = None ):
-		try:
-			apply_to_collection( self._collection, Future, methodcaller( "result", timeout ) )
-			return None
-		except (TimeoutError, CancelledError) as e:
-			raise
-		except Exception as e:
-			return e
-
-	def _mark_done( self, _ ):
-		self._n_done += 1
-		if self._n_done == self._n_futures:
-			for cb in self._done_callbacks:
-				cb( self )
-
-	def add_done_callback( self, callback ):
-		first_callback = self._done_callbacks is None
-		if first_callback:
-			self._done_callbacks = [ ]
-		self._done_callbacks.append( callback )
-		if first_callback:
-			apply_to_collection( self._collection, Future, methodcaller( "add_done_callback", self._mark_done ) )
+		return ft.collect( apply_to_collection( tensors, t.Tensor, self._tensor_broker ) )
 
 
 class BrokeredList( MutableSequence ):

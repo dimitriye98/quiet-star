@@ -502,7 +502,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			if self._params.past_key_values is not None:
 				crop_cache( self._params.past_key_values, 2 * self._l )
 				self._new_lower = 1
-				self._new_upper = 1
+				self._new_upper = 2
 
 			# Invalidate all tokens and logits after the end thought token
 			self._logit_layers[ ett_idx + 1: ] = False
@@ -617,7 +617,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			# in batch size would be roughly equivalent, and easier to implement
 			# so long as we're not memory constrained. Something to consider
 			# if the GPU isn't saturated but VRAM is.
-			upper = pymin( self._new_upper, layer )
+			# upper = pymin( self._new_upper - 1, layer )
+			upper = layer
 
 			assert self._new_lower <= upper
 

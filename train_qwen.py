@@ -3,7 +3,6 @@ import time
 from collections import defaultdict
 from concurrent.futures.process import ProcessPoolExecutor
 from contextlib import nullcontext
-from functools import partial
 from os import cpu_count
 
 import einx
@@ -11,11 +10,13 @@ import lightning.pytorch as pl
 import torch as t
 from peft import get_peft_model, LoraConfig
 from pytorch_lightning.loggers import WandbLogger
+from toolz import compose_left
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, GenerationConfig, StaticCache
 
 from quiet_star.broker import CollectionBroker, be_nice
+from quiet_star.futures.collected import CollectedFuture
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
-from quiet_star.training.data import QuietStarDataModule
+from quiet_star.training.data import QuietStarDataModule, uncurry
 
 
 # warnings.filterwarnings( "error", category = UserWarning, module = 'torch' )
@@ -31,8 +32,6 @@ class QuietStar( pl.LightningModule ):
 			weight_decay = 0.001,
 			adam_epsilon = 1e-6,
 			warmup_steps = 0,
-			train_batch_size = 2,
-			test_val_batch_size = 8,
 			look_ahead = 4,
 			n_thoughts = 2,
 			thought_depth = 12,
@@ -43,7 +42,6 @@ class QuietStar( pl.LightningModule ):
 		super().__init__()
 		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
 		self.validation_pad_token = validation_pad_token
-		self.test_val_batch_size = test_val_batch_size
 		self.broker = CollectionBroker( 1073741824 )
 		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
 		self.outputs = defaultdict( list )
@@ -124,6 +122,13 @@ class QuietStar( pl.LightningModule ):
 			attention_mask = batch[ "attention_mask" ],
 			generation_config = self.validation_gen_config,
 			max_new_tokens = batch[ "answer" ].shape[ -1 ] )
+
+		logs_sc = t.cat( [ l.unsqueeze( 0 ) for l in output_sans_confidence.logits ], dim = 0 )
+		logs_sc = einx.rearrange( "c ... v -> ... c v", logs_sc )
+		future_output_ids_sc = self.broker( output_sans_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ] )
+		future_logs_sc = self.broker( logs_sc )
+		del output_sans_confidence, logs_sc
+
 		output_with_confidence = self.model.generate(
 			inputs = batch[ "input_ids" ],
 			attention_mask = batch[ "attention_mask" ],
@@ -131,22 +136,35 @@ class QuietStar( pl.LightningModule ):
 			max_new_tokens = batch[ "answer" ].shape[ -1 ],
 			confidence_parameter = 0.7, comparison_mode = True )
 
-		logs_sc = t.cat( [ l.unsqueeze( 0 ) for l in output_sans_confidence.logits ], dim = 0 )
 		logs_wc = t.cat( [ l.unsqueeze( 0 ) for l in output_with_confidence.logits ], dim = 0 )
-		logs_sc = einx.rearrange( "c ... v -> ... c v", logs_sc )
 		logs_wc = einx.rearrange( "c ... v -> ... c v", logs_wc )
-		batch[ "output_ids" ] = output_sans_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
-		batch["confident_output_ids"] = output_with_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
-		batch[ "output_logits" ] = logs_sc
-		batch[ "confident_output_logits" ] = logs_wc
-		future = self.broker( batch )
-		future.add_done_callback( partial( self.submit_for_eval, dataloader_idx ) )
+		future_output_ids_wc = self.broker( output_with_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ] )
+		future_logs_wc = self.broker( logs_wc )
+		future_batch = self.broker( batch )
+
+		tupled_future = CollectedFuture(
+			(
+				future_batch,
+				future_output_ids_sc,
+				future_logs_sc,
+				future_output_ids_wc,
+				future_logs_wc) )
+
+		tupled_future.add_done_callback(
+			compose_left(
+				lambda f: f.result(),
+				uncurry(
+					lambda b, oidsc, lsc, oidwc, lwc:
+					b | {
+						"output_ids": oidsc,
+						"output_logits": lsc,
+						"confident_output_ids": oidwc,
+						"confident_output_logits": lwc } ),
+				lambda b: self.evaluation_pool.submit( self.evaluate, b, self.validation_pad_token ),
+				self.outputs[ dataloader_idx ].append ) )
+
 		if hasattr( self, "profiler" ):
 			self.profiler.step()
-
-	def submit_for_eval( self, dataloader_idx, future ):
-		self.outputs[ dataloader_idx ].append(
-			self.evaluation_pool.submit( self.evaluate, future.result(), self.validation_pad_token ) )
 
 	@staticmethod
 	def evaluate( batch, pad_token ):
@@ -224,7 +242,7 @@ def model_factory( config ):
 
 dm = QuietStarDataModule(
 	tokenizer,
-	n_download_proc = 1,
+	n_download_proc = 16,
 )
 
 model = QuietStar(
@@ -250,7 +268,7 @@ def trace_handler( prof ):
 
 do_profile = False
 
-t.cuda.memory._record_memory_history( stacks = "python" )
+t.cuda.memory._record_memory_history( stacks = "all" )
 
 with t.profiler.profile(
 		activities = [

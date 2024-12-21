@@ -7,7 +7,7 @@ from toolz import compose
 from torch.utils.data import DataLoader
 
 
-class Uncurry( Callable ):
+class _Uncurry( Callable ):
 	def __init__( self, f ):
 		self.f = f
 
@@ -15,7 +15,7 @@ class Uncurry( Callable ):
 		return self.f( *args )
 
 
-uncurry = Uncurry
+uncurry = _Uncurry
 
 
 def do_tok_owm( b, tokenizer, max_length ):
@@ -77,7 +77,7 @@ class QuietStarDataModule( pl.LightningDataModule ):
 			self,
 			tokenizer,
 			train_batch_size = 2,
-			test_val_batch_size = 512,
+			test_val_batch_size = 1024,
 			preproc_batch_size = 1024,
 			gsm8k_ans_len = 15,
 			csqa_ans_len = 5,
