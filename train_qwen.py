@@ -13,13 +13,17 @@ from pytorch_lightning.loggers import WandbLogger
 from toolz import compose_left
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, GenerationConfig, StaticCache
 
-from quiet_star.broker import CollectionBroker, be_nice
+from quiet_star.broker import CollectionBroker
 from quiet_star.futures.collected import CollectedFuture
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
 from quiet_star.training.data import QuietStarDataModule, uncurry
 
 
 # warnings.filterwarnings( "error", category = UserWarning, module = 'torch' )
+
+
+def be_nice():
+	os.nice( 10 )
 
 
 class QuietStar( pl.LightningModule ):
@@ -89,9 +93,14 @@ class QuietStar( pl.LightningModule ):
 
 	def training_step( self, batch, batch_idx ):
 		if self.hparams.confidence_loss_beta_step_up_start < self.current_epoch <= self.hparams.confidence_loss_beta_step_up_end:
-			lerp = self.current_epoch - self.hparams.confidence_loss_beta_step_up_start / ( self.hparams.confidence_loss_beta_step_up_end - self.hparams.confidence_loss_beta_step_up_start )
 			# Linear ramp from start to end
-			self.model.confidence_loss_beta = self.initial_confidence_loss_beta * ( 1 - lerp ) + (self.hparams.confidence_loss_beta_step_up * self.initial_confidence_loss_beta) * lerp
+			now = self.current_epoch
+			start = self.hparams.confidence_loss_beta_step_up_start
+			end = self.hparams.confidence_loss_beta_step_up_end
+			lerp = (now - start) / (end - start)
+			lower = self.initial_confidence_loss_beta
+			upper = self.hparams.confidence_loss_beta_step_up * lower
+			self.model.confidence_loss_beta = lower * (1 - lerp) + upper * lerp
 		loss = self.model(
 			input_ids = batch[ "input_ids" ], labels = batch[ "input_ids" ],
 			attention_mask = batch[ "attention_mask" ], past_key_values = self.training_cache ).loss
@@ -235,7 +244,9 @@ def model_factory( config ):
 
 	model._lm_model = get_peft_model( model._lm_model, peft_config )
 
-	print(f"Model has { model.num_parameters() } parameters, of which { model.num_parameters( only_trainable = True ) } are trainable")
+	print(
+		f"Model has {model.num_parameters()} parameters, of which "
+		f"{model.num_parameters( only_trainable = True )} are trainable" )
 
 	return model
 
@@ -246,7 +257,11 @@ dm = QuietStarDataModule(
 )
 
 model = QuietStar(
-	config, model_factory, validation_pad_token = tokenizer.pad_token_id, train_batch_size = dm.train_batch_size, test_val_batch_size = dm.test_val_batch_size )
+	config,
+	model_factory,
+	validation_pad_token = tokenizer.pad_token_id,
+	train_batch_size = dm.train_batch_size,
+	test_val_batch_size = dm.test_val_batch_size )
 
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
 	every_n_train_steps = 50,
@@ -304,7 +319,7 @@ with t.profiler.profile(
 
 	try:
 		trainer.fit( model, datamodule = dm )
-		# trainer.validate( model, datamodule = dm )
+	# trainer.validate( model, datamodule = dm )
 	except t.OutOfMemoryError as e:
 		print( "OOM, dumping memory snapshot...", flush = True )
 		t.cuda.memory._dump_snapshot( os.path.join( trace_dir, "memory_snapshot.json" ) )

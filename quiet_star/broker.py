@@ -1,4 +1,4 @@
-import os
+import logging
 from abc import ABCMeta, abstractmethod
 from collections.abc import MutableSequence
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +9,8 @@ import torch as t
 from lightning_utilities import apply_to_collection
 
 from . import futures as ft
+
+logger = logging.getLogger( __name__ )
 
 
 class Broker( metaclass = ABCMeta ):
@@ -119,7 +121,7 @@ class TensorBroker( Broker ):
 
 	def __call__( self, tensor ):
 		if not (subbroker := self._subbrokers.get( tensor.dtype, None )):
-			print( f"Creating broker for tensors of dtype {tensor.dtype}", flush = True )
+			logger.log( logging.INFO, f"Creating subbroker for tensors of dtype {tensor.dtype}" )
 			subbroker = _ChoppingTensorBroker( self._chop, tensor.dtype, self._size )
 			self._subbrokers[ tensor.dtype ] = subbroker
 		return subbroker( tensor )
@@ -158,7 +160,3 @@ class BrokeredList( MutableSequence ):
 
 	def __len__( self ):
 		return len( self.futures )
-
-
-def be_nice():
-	os.nice( 10 )
