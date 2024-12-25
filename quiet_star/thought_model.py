@@ -14,7 +14,7 @@ pymin = min
 pymax = max
 from einx.op import *
 from torch import Tensor, LongTensor, FloatTensor
-from torch.nn.functional import gumbel_softmax, relu, cross_entropy, pad, binary_cross_entropy
+from torch.nn.functional import gumbel_softmax, relu, cross_entropy, binary_cross_entropy
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig, Cache, DynamicCache, StaticCache, \
 	GenerationConfig
 from transformers.activations import ACT2FN
@@ -182,6 +182,11 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		self.confidence_head = ConfidenceHead( config )
 		self.confidence_loss_beta = config.confidence_loss_beta
 		self.confidence_parameter = config.confidence_parameter
+		self.loss_fns = [
+			self.calculate_base_loss,
+			self.calculate_policy_loss,
+			self.calculate_confidence_loss
+		]
 
 	@property
 	@abstractmethod
@@ -481,258 +486,50 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 			else:
 				return (logits,) + ((pkv,) if (pkv := outputs.past_key_values) is not None else tuple())
 
-	class ThoughtState:
-		@property
-		def l( self ):
-			return self._l
-
-		@property
-		def d( self ):
-			return self._d
-
-		@property
-		def n( self ):
-			return self._n
-
-		def mutate_for_confidence( self, ett_idx ):
-			# Shift all thoughts by one
-			self[ 0:ett_idx ][ ..., 1: ] = self[ 0:ett_idx ][ ..., :-1 ]
-
-			# Invalidate the cache down to the start thought token layer and adjust the cache pointers
-			if self._params.past_key_values is not None:
-				crop_cache( self._params.past_key_values, 2 * self._l )
-				self._new_lower = 1
-				self._new_upper = 2
-
-			# Invalidate all tokens and logits after the end thought token
-			self._logit_layers[ ett_idx + 1: ] = False
-			self._token_layers[ ett_idx + 1: ] = False
-
-		def __init__(
-				self,
-				model,
-				d: int,
-				n: int,
-				token_dtype,
-				logit_dtype,
-				hidden_dtype,
-				hidden_container_provider,
-				params ):
-			self._model = model
-			padding_mask = params.attention_mask
-			self._l = padding_mask.shape[ -1 ]
+	class ThoughtMask:
+		def __init__( self, l: int, d: int, k: int, padding_mask: Tensor ):
+			self._k = k
 			self._d = d
-			self._n = n
-			self._raw_tensor = rearrange(
-				"... l -> ... n d l", t.empty_like( padding_mask, dtype = token_dtype ), n = self.n,
-				d = self.d ).contiguous()
-			self._logits = rearrange(
-				"... -> ... v", t.empty_like( self._raw_tensor, dtype = logit_dtype ),
-				v = self._model.lm_model.config.vocab_size ).contiguous()
-			self._token_layers = t.full( (d,), False, dtype = t.bool )
-			self._logit_layers = t.full_like( self._token_layers, False )
-			self._new_lower = 0
-			self._new_upper = 0
-			self._layer_dim = self._raw_tensor.ndim - 2
-			self.hidden_states = hidden_container_provider( self.l, self.d, self.n, hidden_dtype )
-			self._logit_getter = self._LogitGetter( self )
-			self._thought_mask = self.ThoughtMask(
-				self.l, self.d, self._model.lm_model.config.num_attention_heads,
-				rearrange( "b... l -> b... n l", padding_mask, n = self.n ) )
-			self._params = params
+			self._l = l
+			self._thought_mask = self.prepare_thought_mask( d, l, padding_mask )
 
-		@property
-		def thought_mask( self ):
-			return self._thought_mask
-
-		class ThoughtMask:
-			def __init__( self, l: int, d: int, k: int, padding_mask: Tensor ):
-				self._k = k
-				self._l = l
-				self._thought_mask = self.prepare_thought_mask( d, l, padding_mask )
-
-			def __getitem__( self, idx ):
-				d, D = idx
-
-				return self.invert_mask( self.flatten_thought_mask( self._thought_mask[ ..., d, D, :, : ], self._k ) )
-
-			@staticmethod
-			@t.compiler.disable
-			@memoize
-			def _prepare_thought_mask_encoding(
-					d: int, l: int, device = t.get_default_device() ):
-				with t.device( device ):
-					if d == 1:
-						ret = t.ones( l, l ).tril().unsqueeze( 0 ).unsqueeze( 0 )
-					else:
-						thought_thought = multiply(
-							"d..., l... -> d... l...", t.ones( d, d - 1 ).tril( -1 ), t.eye( l ) )
-						causal = rearrange( "l... -> d l...", t.ones( l, l ).tril(), d = d )
-						ret = rearrange( "d l L, d D l L -> d (1 + D) l L", causal, thought_thought )
-					return ret
-
-			@classmethod
-			def prepare_thought_mask( cls, d: int, l: int, padding_mask: Tensor ):
-				assert padding_mask.shape[ -1 ] == l
-				thought_mask = cls._prepare_thought_mask_encoding( d, l, padding_mask.device )
-				return multiply( "b... l, d D l L -> b... d D l L", padding_mask, thought_mask )
-
-			@staticmethod
-			def flatten_thought_mask( thought_mask: Tensor, k = None ):
-				k = tuple() if k is None else (k,)
-				return rearrange( "b... d D l L -> (b...) (k...) (d l) (D L)", thought_mask, k = k )
-
-			@staticmethod
-			def invert_mask( mask: Tensor ):
-				return t.zeros_like( mask ).masked_fill( mask == 0, t.finfo( mask.dtype ).min )
-
-		def _broadcast_logits( self, layer ):
-			if layer == 0:
-				raise ValueError(
-					"this abstraction is generative, that is logits beget tokens, not the other way around, so layer 0 is the input" )
-			if isinstance( layer, slice ):
-				for i in range(
-						layer.start if layer.start is not None else 0, layer.stop if layer.stop is not None else self.d,
-						layer.step if layer.step is not None else 1 ):
-					self._broadcast_logits( i )
-				return
-			elif isinstance( layer, Sequence ):
-				for i in layer:
-					self._broadcast_logits( i )
-				return
-
-			if self._logit_layers[ layer ]:
-				return
-			i = 1
-
-			if not self._logit_layers[ layer - 1 ] and layer > 1:
-				self._broadcast_logits( layer - 1 )
-
-			while (~self._token_layers[ :layer ]).any():
-				self._sample_tokens( layer - i )
-				i += 1
-				assert i < layer
-
-			# While we could process in parallel here in some cases, an increase
-			# in batch size would be roughly equivalent, and easier to implement
-			# so long as we're not memory constrained. Something to consider
-			# if the GPU isn't saturated but VRAM is.
-			# upper = pymin( self._new_upper - 1, layer )
-			upper = layer
-
-			assert self._new_lower <= upper
-
-			tm = self.thought_mask[ self._new_lower:upper, : ]
-
-			if isinstance( self._params.past_key_values, StaticCache ):
-				cache_position = self.flatten_cache_position( t.arange( self._new_lower, upper ) )
-			else:
-				cache_position = None
-
-			outputs = self._model.lm_model(
-				input_ids = rearrange( "b... d l -> (b...) (d l)", self[ self._new_lower:upper ] ),
-				attention_mask = tm,
-				# position_ids: Optional[ LongTensor ] = None
-				past_key_values = self._params.past_key_values,
-				# inputs_embeds: Optional[ FloatTensor ] = None
-				# labels: Optional[ LongTensor ] = None
-				use_cache = self._params.use_cache,
-				# output_attentions: Optional[ bool ] = None
-				output_hidden_states = True,
-				return_dict = True,
-				cache_position = cache_position,
-				num_logits_to_keep = self.l
-			)
-
-			self._new_lower = upper
-			self._params.past_key_values = outputs.past_key_values
-			self.hidden_states[ layer ] = rearrange(
-				"(b n) l e -> b n l e", outputs.hidden_states[ -1 ], l = self.l, n = self.n )
-			self._logit_layers[ layer ] = True
-
-			log = outputs.logits
-			log[ ..., self._model.start_thought_token ] = -t.inf
-			log[ ..., self._model.end_thought_token ] = -t.inf
-			self.logits[ layer ] = rearrange( "(b n) l v -> b n l v", outputs.logits, l = self.l, n = self.n )
-
-		@t.no_grad()
-		def _sample_tokens( self, layer ):
-			if isinstance( layer, slice ):
-				for i in range(
-						layer.start if layer.start is not None else 0, layer.stop if layer.stop is not None else self.d,
-						layer.step if layer.step is not None else 1 ):
-					self._sample_tokens( i )
-				return
-			elif isinstance( layer, Sequence ):
-				for i in layer:
-					self._sample_tokens( i )
-				return
-
-			if self._token_layers[ layer ]:
-				return
-			if not self._logit_layers[ layer ]:
-				self._broadcast_logits( layer )
-
-			logits = self.logits[ layer ]
-
-			if self._model.thought_temperature == 0.0:
-				toks = logits.argmax( dim = -1 )
-			else:
-				toks = gumbel_softmax( logits, tau = self._model.thought_temperature, dim = -1, hard = True ).argmax(
-					dim = -1 )
-
-			self[ layer ] = toks
-			self._new_upper = layer + 1
-
-		def flatten_cache_position( self, cache_layers: Tensor ):
-			return (t.arange( self.l ) + self.l * cache_layers.reshape( -1, 1 )).reshape( -1 )
-
-		def _get( self, table, gen, layer ):
-			gen( layer )
-			dim = self._layer_dim % table.ndim
-			idx = [ slice( None, None ) ] * table.ndim
-			idx[ dim ] = layer
-			return table[ idx ]
-
-		def _get_logits( self, idx ):
-			return self._get( self._logits, self._broadcast_logits, idx )
-
-		def _get_tokens( self, idx ):
-			return self._get( self._raw_tensor, self._sample_tokens, idx )
+		def let( self, *, l: Optional[ int ] = None, d: Optional[ int ] = None, k: Optional[ int ] = None, padding_mask: Tensor):
+			return self.__class__( l or self._l, d or self._d, k or self._k, padding_mask )
 
 		def __getitem__( self, idx ):
-			return self._get_tokens( idx )
+			d, D = idx
 
-		class _LogitGetter:
-			def __init__( self, ts ):
-				self._ts = ts
+			return self.invert_mask( self.flatten_thought_mask( self._thought_mask[ ..., d, D, :, : ], self._k ) )
 
-			def __getitem__( self, idx ):
-				return self._ts._get_logits( idx )
+		@staticmethod
+		@t.compiler.disable
+		@memoize
+		def _prepare_thought_mask_encoding(
+				d: int, l: int, device = t.get_default_device() ):
+			with t.device( device ):
+				if d == 1:
+					ret = t.ones( l, l ).tril().unsqueeze( 0 ).unsqueeze( 0 )
+				else:
+					thought_thought = multiply(
+						"d..., l... -> d... l...", t.ones( d, d - 1 ).tril( -1 ), t.eye( l ) )
+					causal = rearrange( "l... -> d l...", t.ones( l, l ).tril(), d = d )
+					ret = rearrange( "d l L, d D l L -> d (1 + D) l L", causal, thought_thought )
+				return ret
 
-			def __setitem__( self, idx, value ):
-				idx_list = [ slice( None, None ) ] * self._ts._logits.ndim
-				if idx != 0:
-					self._ts._sample_tokens( idx - 1 )  # ensure we're in a valid state
-				idx_list[ self._ts._layer_dim % self._ts._logits.ndim ] = idx
-				self._ts._logits[ tuple( idx_list ) ] = value
-				self._ts._logit_layers[ idx ] = True
+		@classmethod
+		def prepare_thought_mask( cls, d: int, l: int, padding_mask: Tensor ):
+			assert padding_mask.shape[ -1 ] == l
+			thought_mask = cls._prepare_thought_mask_encoding( d, l, padding_mask.device )
+			return multiply( "b... l, d D l L -> b... d D l L", padding_mask, thought_mask )
 
-		@property
-		def logits( self ):
-			return self._logit_getter
+		@staticmethod
+		def flatten_thought_mask( thought_mask: Tensor, k = None ):
+			# k = tuple() if k is None else (k,)
+			return rearrange( "b... d D l L -> (b...) k (d l) (D L)", thought_mask, k = k )
 
-		def __setitem__( self, idx, value ):
-			idx_list = [ slice( None, None ) ] * self._raw_tensor.ndim
-			if idx != 0:
-				self._sample_tokens( idx - 1 )  # ensure we're in a valid state
-			idx_list[ self._layer_dim % self._raw_tensor.ndim ] = idx
-			self._raw_tensor[ tuple( idx_list ) ] = value
-			self._token_layers[ idx ] = True
-			if self._new_upper < idx + 1:
-				self._new_upper = idx + 1
-			else:
-				warnings.warn( "setting an already set layer breaks the cache and is undefined behavior" )
+		@staticmethod
+		def invert_mask( mask: Tensor ):
+			return t.zeros_like( mask ).masked_fill( mask == 0, t.finfo( mask.dtype ).min )
 
 	Loss = Tuple[ str, Tensor, Tensor ]
 	Metric = Tuple[ str, Tensor ]
@@ -755,134 +552,254 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		loss = rearrange( "(B... l) -> B... l", ls, **solve( "B... l", targets ) )
 
 		if mask is not None:
-			loss.masked_fill_( ~(mask.to( t.bool )), t.nan )
+			loss = loss.masked_fill( ~(mask.to( t.bool )), t.nan )
 
 		return reduce( "... d l -> ... l", loss, op = t.nanmean )
 
 	@classmethod
-	def compute_policy_loss( cls, base_loss, logits_thought, targets_thought, *, temperature = 0.0 ):
+	def compute_policy_loss( cls, base_loss, logits_thought, targets_thought, *, mask = None, temperature = 0.0 ):
 		with t.no_grad():
 			r_mean = -reduce( "b... n l -> b... 1 l", base_loss, op = t.nanmean )
 			reward = relu( -base_loss - r_mean )
 
 		policy_loss = reward * cls.compute_cross_entropy_loss(
 			logits_thought, targets_thought,
+			mask = mask,
 			temperature = temperature )
 
 		return policy_loss, (("r_mean", r_mean), ("reward", reward))
 
-	# TODO: Replace with a better tensor proxy
-	class ForgetfulDict:
-		def __init__( self, allowed_keys, default_value = None ):
-			self.allowed_keys = allowed_keys
-			self.default_value = default_value
-			self.dict = { }
+	# @compile_on_first_call
+	# def training_forward( self, params: ForwardParams ):
+	# 	ts = self.ThoughtState(
+	# 		self,
+	# 		self.thought_depth + 3 + self.look_ahead,
+	# 		self.n_thoughts,
+	# 		params.input_ids.dtype,
+	# 		self.dtype,
+	# 		self.dtype,
+	# 		lambda *args: self.ForgetfulDict(
+	# 			{ 1 } | { i for i in range( self.thought_depth + 3, self.thought_depth + 3 + self.look_ahead ) },
+	# 		),
+	# 		params )
+	# 	ts[ 0 ] = rearrange( "b... l -> b... n l", params.input_ids, n = self.n_thoughts )
+	# 	ts[ 1 ] = self.start_thought_token
+	# 	ts[ self.thought_depth + 2 ] = self.end_thought_token
+	# 	lab_len = ts.l - self.look_ahead
+	# 	labels = params.labels[ ..., 1: ].unfold( -1, lab_len, 1 )
+	# 	pl = ts.logits[ 1 ]
+	# 	ph = ts.hidden_states[ 1 ]
+	# 	ql, qh = [ ], [ ]
+	# 	padded_labels = pad( labels, (0, self.look_ahead) )
+	# 	for i in range( self.look_ahead ):
+	# 		j = i + self.thought_depth + 3
+	# 		ql.append( ts.logits[ j ] )
+	# 		qh.append( ts.hidden_states[ j ] )
+	# 		ts[ j ] = padded_labels[ ..., i, : ]
+	#
+	# 	ql = rearrange( "d b... l v-> b... d l v", t.stack( ql ) )[ ..., :-self.look_ahead, : ]
+	# 	qh = rearrange( "d b... l e -> b... d l e", t.stack( qh ) )[ ..., :-self.look_ahead, : ]
+	#
+	# 	pl = rearrange( "b... d v l -> b... d l v", pl[ ..., 1:, : ].unfold( -2, lab_len, 1 ) )
+	# 	ph = rearrange( "b... d e l -> b... d l e", ph[ ..., 1:, : ].unfold( -2, lab_len, 1 ) )
+	#
+	# 	alpha = self.mixer_head( ph, qh )
+	#
+	# 	logits_loss = ql * alpha + pl * (1 - alpha)
+	#
+	# 	sliding_mask = rearrange(
+	# 		"b... d l -> b... n d l", params.attention_mask[ ..., 1: ].unfold( -1, lab_len, 1 ), n = self.n_thoughts )
+	#
+	# 	targets_loss = rearrange( "b... d l -> b... n d l", labels, n = self.n_thoughts )
+	# 	base_loss = self.compute_cross_entropy_loss( logits_loss, targets_loss, mask = sliding_mask )
+	# 	logits_thought = ts.logits[ 2:self.thought_depth + 2 ]
+	# 	targets_thought = ts[ 2:self.thought_depth + 2 ]
+	# 	policy_loss, policy_metrics = self.compute_policy_loss(
+	# 		base_loss, logits_thought[ ..., :-self.look_ahead, : ], targets_thought[ ..., :-self.look_ahead ],
+	# 		temperature = self.reinforce_temperature )
+	#
+	# 	del ql, qh
+	# 	ts.mutate_for_confidence( self.thought_depth + 2 )
+	# 	qch = [ ], [ ]
+	# 	for i in range( self.look_ahead ):
+	# 		j = i + self.thought_depth + 3
+	# 		ts.logits[ j ]
+	# 		qch.append( ts.hidden_states[ j ] )
+	# 		ts[ j ] = padded_labels[ ..., i, : ]
+	#
+	# 	false_alpha = self.mixer_head( ph, qch )
+	# 	confidence = self.confidence_head( ph, qch, false_alpha )
+	# 	sliding_mask[ ..., 0 ] = 0  # Mask out the thought from the first token
+	# 	with t.no_grad():
+	# 		# Intentionally break the gradients to enforce causality
+	# 		targets_confidence = false_alpha.ge( alpha ).to( self.dtype )
+	#
+	# 	confidence_loss = binary_cross_entropy( confidence, targets_confidence, reduction = "none" )
+	# 	confidence_loss.masked_fill_( ~(sliding_mask.to( t.bool )), t.nan )
+	# 	confidence_loss.nanmean( dim = -1 )
+	#
+	# 	losses = (
+	# 		("base_loss", base_loss, self.base_loss_beta),
+	# 		("policy_loss", policy_loss, self.policy_loss_beta),
+	# 		("confidence_loss", confidence_loss, self.confidence_loss_beta))
+	#
+	# 	# callback_result = self._loss_callback(
+	# 	# 	thought_state = ts,
+	# 	# 	targets_loss = targets_loss,
+	# 	# 	targets_thought = targets_thought,
+	# 	# 	pl = pl,
+	# 	# 	ph = ph,
+	# 	# 	ql = ql,
+	# 	# 	qh = qh,
+	# 	# 	alpha = alpha,
+	# 	# 	mask = sliding_mask )
+	# 	#
+	# 	# if callback_result is not None:
+	# 	# 	additional_losses, additional_metrics = callback_result
+	# 	# else:
+	# 	# 	additional_losses, additional_metrics = (), ()
+	# 	#
+	# 	# if callback_result is not None:
+	# 	# 	losses = tuple( losses ) + tuple( additional_losses )
+	#
+	# 	aggregate_loss = None
+	# 	for _, loss, beta in losses:
+	# 		if aggregate_loss is None:
+	# 			aggregate_loss = beta * loss
+	# 		else:
+	# 			aggregate_loss += beta * loss
+	#
+	# 	aggregate_loss = aggregate_loss.mean()
+	#
+	# 	if self.logger is not None:
+	# 		with t.no_grad():
+	# 			thoughtful_loss = self.compute_cross_entropy_loss(
+	# 				ql[ ..., -self.look_ahead:, :, : ], targets_loss, mask = sliding_mask )
+	#
+	# 			metrics_to_log = (
+	# 				("thoughtful_loss", thoughtful_loss),
+	# 				("alpha", alpha),
+	# 			)
+	#
+	# 			if policy_metrics is not None:
+	# 				metrics_to_log += policy_metrics
+	#
+	# 			# metrics_to_log += additional_metrics
+	#
+	# 			metrics_to_log += tuple( (name, loss) for name, loss, _ in losses )
+	#
+	# 			log_dict = OrderedDict()
+	# 			for name, metric in metrics_to_log:
+	# 				log_dict[ f"{name}_avg" ] = metric.mean()
+	# 			log_dict[ f"{name}_max" ] = metric.max()
+	# 			log_dict[ f"{name}_min" ] = metric.min()
+	# 			log_dict[ "aggregate_loss" ] = aggregate_loss
+	#
+	# 			self.logger( log_dict, prog_bar = True )
+	#
+	# 	return CausalLMOutputWithPast(
+	# 		loss = aggregate_loss,
+	# 		logits = logits_loss[ ..., -1, :, : ],
+	# 		past_key_values = params.past_key_values
+	# 	)
 
-		def __getitem__( self, key ):
-			if key in self.dict:
-				return self.dict[ key ]
-			else:
-				return self.default_value
+	@staticmethod
+	def append_layer( acc, new_layer, dim ):
+		if acc is None:
+			return new_layer
 
-		def __setitem__( self, key, value ):
-			if key in self.allowed_keys:
-				self.dict[ key ] = value
+		if not t.is_tensor( new_layer ):
+			new_layer = t.tensor( new_layer ).expand_as( acc.select( dim, 0 ) )
 
-	@compile_on_first_call
-	def training_forward( self, params: ForwardParams ):
-		ts = self.ThoughtState(
-			self,
-			self.thought_depth + 3 + self.look_ahead,
-			self.n_thoughts,
-			params.input_ids.dtype,
-			self.dtype,
-			self.dtype,
-			lambda *args: self.ForgetfulDict(
-				{ 1 } | { i for i in range( self.thought_depth + 3, self.thought_depth + 3 + self.look_ahead ) },
-			),
-			params )
-		ts[ 0 ] = rearrange( "b... l -> b... n l", params.input_ids, n = self.n_thoughts )
-		ts[ 1 ] = self.start_thought_token
-		ts[ self.thought_depth + 2 ] = self.end_thought_token
-		lab_len = ts.l - self.look_ahead
-		labels = params.labels[ ..., 1: ].unfold( -1, lab_len, 1 )
-		pl = ts.logits[ 1 ]
-		ph = ts.hidden_states[ 1 ]
-		ql, qh = [ ], [ ]
-		padded_labels = pad( labels, (0, self.look_ahead) )
-		for i in range( self.look_ahead ):
-			j = i + self.thought_depth + 3
-			ql.append( ts.logits[ j ] )
-			qh.append( ts.hidden_states[ j ] )
-			ts[ j ] = padded_labels[ ..., i, : ]
+		if new_layer.ndim < acc.ndim:
+			new_layer = new_layer.unsqueeze( dim )
+		return t.cat( (acc, new_layer), dim = dim )
 
-		ql = rearrange( "d b... l v-> b... d l v", t.stack( ql ) )[ ..., :-self.look_ahead, : ]
-		qh = rearrange( "d b... l e -> b... d l e", t.stack( qh ) )[ ..., :-self.look_ahead, : ]
+	@staticmethod
+	def cat_not_null( tensors, dim ):
+		return t.cat( [ T for T in tensors if T is not None ], dim = dim )
 
-		pl = rearrange( "b... d v l -> b... d l v", pl[ ..., 1:, : ].unfold( -2, lab_len, 1 ) )
-		ph = rearrange( "b... d e l -> b... d l e", ph[ ..., 1:, : ].unfold( -2, lab_len, 1 ) )
+	@staticmethod
+	def prepare_cache_positions( seq_len, unseen_layers ):
+		return t.arange( seq_len ) + seq_len * t.arange( unseen_layers[ 0 ], unseen_layers[ -1 ] + 1 ).unsqueeze( -1 )
 
-		alpha = self.mixer_head( ph, qh )
+	@staticmethod
+	def prepare_position_ids( seq_len, unseen_layers ):
+		pos_per_layer = t.arange( unseen_layers[ 0 ], unseen_layers[ -1 ] + seq_len )
+		sliding_pos = pos_per_layer.unfold( -1, seq_len, 1 )
+		return sliding_pos
 
-		logits_loss = ql * alpha + pl * (1 - alpha)
+	def broadcast_logits( self, ts, mask, cache, unseen_layers, layers_to_keep: Optional[ int ] = 1 ):
+		B, d, l = solve( "b... d l", ts ).values()
 
-		sliding_mask = rearrange(
-			"b... d l -> b... n d l", params.attention_mask[ ..., 1: ].unfold( -1, lab_len, 1 ), n = self.n_thoughts )
+		if layers_to_keep is None:
+			layers_to_keep = d
 
-		targets_loss = rearrange( "b... d l -> b... n d l", labels, n = self.n_thoughts )
-		base_loss = self.compute_cross_entropy_loss( logits_loss, targets_loss, mask = sliding_mask )
-		logits_thought = ts.logits[ 2:self.thought_depth + 2 ]
-		targets_thought = ts[ 2:self.thought_depth + 2 ]
-		policy_loss, policy_metrics = self.compute_policy_loss(
-			base_loss, logits_thought[ ..., :-self.look_ahead, : ], targets_thought[ ..., :-self.look_ahead ],
-			temperature = self.reinforce_temperature )
+		if cache is not None:
+			cache_pos = rearrange( "d l -> (d l)", self.prepare_cache_positions( ts.shape[ -1 ], unseen_layers ) )
+			a_mask = mask[ unseen_layers[ 0 ]:unseen_layers[ -1 ] + 1, : ]
+		else:
+			cache_pos = None
+			a_mask = mask[ unseen_layers[ 0 ]:unseen_layers[ -1 ] + 1, unseen_layers[ 0 ]:unseen_layers[ -1 ] + 1 ]
 
-		del ql, qh
-		ts.mutate_for_confidence( self.thought_depth + 2 )
-		qch = [ ], [ ]
-		for i in range( self.look_ahead ):
-			j = i + self.thought_depth + 3
-			ts.logits[ j ]
-			qch.append( ts.hidden_states[ j ] )
-			ts[ j ] = padded_labels[ ..., i, : ]
+		out = self.lm_model(
+			input_ids = rearrange( "b... d l -> (b...) (d l)", ts[ ..., -len( unseen_layers ):, : ] ),
+			position_ids = rearrange(
+				"d l -> (b...) (d l)", self.prepare_position_ids( ts.shape[ -1 ], unseen_layers ), b = B ),
+			attention_mask = a_mask,
+			past_key_values = cache,
+			use_cache = cache is not None,
+			output_attentions = False,
+			output_hidden_states = True,
+			return_dict = True,
+			cache_position = cache_pos,
+			num_logits_to_keep = l * layers_to_keep,
+		)
 
-		false_alpha = self.mixer_head( ph, qch )
-		confidence = self.confidence_head( ph, qch, false_alpha )
-		sliding_mask[ ..., 0 ] = 0  # Mask out the thought from the first token
+		out_log = rearrange( "(b...) (d l) v -> b... d l v", out.logits, b = B, d = layers_to_keep, l = l )
+		out_hidden = rearrange(
+			"(b...) (d l) e -> b... d l e", out.hidden_states[ -1 ][ ..., -l * layers_to_keep:, : ], b = B,
+			d = layers_to_keep, l = l )
+
+		return out_log, out_hidden
+
+	def advance_thoughts( self, ts, logs, mask, cache, unseen_layers ):
+		new_logs, _ = self.broadcast_logits( ts, mask, cache, unseen_layers )
+
 		with t.no_grad():
-			# Intentionally break the gradients to enforce causality
-			targets_confidence = false_alpha.ge( alpha ).to( self.dtype )
+			if self.thought_temperature == 0.0:
+				tok = new_logs.argmax( dim = -1 )
+			else:
+				tok = gumbel_softmax(
+					new_logs, tau = self.thought_temperature, hard = True ).argmax( dim = -1 )
 
-		confidence_loss = binary_cross_entropy( confidence, targets_confidence, reduction = "none" )
-		confidence_loss.masked_fill_( ~(sliding_mask.to( t.bool )), t.nan )
-		confidence_loss.nanmean( dim = -1 )
+		return self.cat_not_null( (ts, tok), dim = -2 ), self.cat_not_null( (logs, new_logs), dim = -3 )
 
-		losses = (
-			("base_loss", base_loss, self.base_loss_beta),
-			("policy_loss", policy_loss, self.policy_loss_beta),
-			("confidence_loss", confidence_loss, self.confidence_loss_beta))
+	def calculate_loss( self, ts, cache, unseen_layers, labels, mask, padding_mask, logits_thought ):
+		losses = OrderedDict()
+		metrics = OrderedDict()
+		misc_state = { }
 
-		# callback_result = self._loss_callback(
-		# 	thought_state = ts,
-		# 	targets_loss = targets_loss,
-		# 	targets_thought = targets_thought,
-		# 	pl = pl,
-		# 	ph = ph,
-		# 	ql = ql,
-		# 	qh = qh,
-		# 	alpha = alpha,
-		# 	mask = sliding_mask )
-		#
-		# if callback_result is not None:
-		# 	additional_losses, additional_metrics = callback_result
-		# else:
-		# 	additional_losses, additional_metrics = (), ()
-		#
-		# if callback_result is not None:
-		# 	losses = tuple( losses ) + tuple( additional_losses )
+		sliding_labels = labels.unfold( -1, ts.shape[ -1 ], 1 )
+		sliding_mask = padding_mask.unfold( -1, ts.shape[ -1 ], 1 )
+
+		naive_state = sliding_labels[ ..., :-1, : ]
+
+		assert naive_state.shape[ -2 ] == self.look_ahead
+
+		ts = t.cat( (ts, naive_state[ ..., 1:, : ]), dim = -2 )
+
+		for fn in self.loss_fns:
+			new_losses, new_metrics, new_state = fn(
+				cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+				metrics, misc_state )
+
+			losses.update( new_losses )
+			metrics.update( new_metrics )
+			misc_state.update( new_state )
 
 		aggregate_loss = None
-		for _, loss, beta in losses:
+		for loss, beta in losses.values():
 			if aggregate_loss is None:
 				aggregate_loss = beta * loss
 			else:
@@ -892,35 +809,144 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 
 		if self.logger is not None:
 			with t.no_grad():
-				thoughtful_loss = self.compute_cross_entropy_loss(
-					ql[ ..., -self.look_ahead:, :, : ], targets_loss, mask = sliding_mask )
+				# thoughtful_loss = self.compute_cross_entropy_loss( ql[ ..., -self.look_ahead:, :, : ], targets_loss, mask = sliding_mask )
 
-				metrics_to_log = (
-					("thoughtful_loss", thoughtful_loss),
-					("alpha", alpha),
-				)
-
-				if policy_metrics is not None:
-					metrics_to_log += policy_metrics
-
-				# metrics_to_log += additional_metrics
-
-				metrics_to_log += tuple( (name, loss) for name, loss, _ in losses )
+				for name, (loss, _) in losses.items():
+					metrics[ name ] = loss
 
 				log_dict = OrderedDict()
-				for name, metric in metrics_to_log:
+				for name, metric in metrics.items():
 					log_dict[ f"{name}_avg" ] = metric.mean()
-				log_dict[ f"{name}_max" ] = metric.max()
-				log_dict[ f"{name}_min" ] = metric.min()
+					log_dict[ f"{name}_max" ] = metric.max()
+					log_dict[ f"{name}_min" ] = metric.min()
+
 				log_dict[ "aggregate_loss" ] = aggregate_loss
 
 				self.logger( log_dict, prog_bar = True )
 
+		return aggregate_loss
+
+	def calculate_confidence_loss(
+			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+			metrics, misc_state ):
+		# Shift the thoughts one step forward
+		cts = t.cat(
+			(
+				ts[ ..., :2, 1: ],
+				ts[ ..., 2:2 + self.thought_depth, :-1 ],
+				ts[ ..., 2 + self.thought_depth:, 1: ],
+			), dim = -2 )
+
+		# Keep cts the same shape as ts, to avoid recompiling the model
+		cts = t.cat((t.zeros((*cts.shape[:-1], 1), dtype = cts.dtype), cts), dim = -1)
+
+		# Mask out the inserted padding tokens
+		new_mask = t.ones(cts.shape[-1], dtype= sliding_mask.dtype)
+		new_mask[0] = 0
+		padding_mask = sliding_mask[..., 0, :] * new_mask
+		mask = mask.let( padding_mask = padding_mask )
+
+		cql, cqh = self.broadcast_logits( cts, mask, None, t.arange( self.look_ahead ), self.look_ahead )
+		# Confidence loss should not influence the mixer head
+		with t.no_grad():
+			calpha = self.mixer_head( misc_state[ "ph" ], cqh )
+			confidence_target = calpha.ge( misc_state[ "alpha" ] )
+		confidence = self.confidence_head( misc_state[ "ph" ], cqh, calpha )
+		confidence_loss = binary_cross_entropy( confidence, confidence_target.to( confidence.dtype ), reduction = "none" )
+		confidence_loss = reduce("b... [d] l 1 -> b... l", confidence_loss, op=t.nanmean)
+		return {
+			"confidence loss": (confidence_loss, self.confidence_loss_beta),
+		}, {
+			"confidence": confidence,
+		}, { }
+
+	def calculate_policy_loss(
+			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+			metrics, misc_state ):
+		thoughts = ts[ ..., 2:2 + self.thought_depth, : ]
+
+		policy_loss, policy_metrics = self.compute_policy_loss(
+			losses[ "base loss" ][ 0 ], logits_thought, thoughts, mask = sliding_mask[ ..., :1, : ],
+			temperature = self.reinforce_temperature )
+
+		return {
+			"policy loss": (policy_loss, self.policy_loss_beta),
+		}, {
+			k: v for k, v in policy_metrics
+		}, { }
+
+	def calculate_base_loss(
+			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+			metrics, misc_state ):
+		targets_base, mask_base = sliding_labels[ ..., 1:, : ], sliding_mask[ ..., :-1, : ]
+
+		pl, ph = self.broadcast_logits( naive_state, mask, None, t.arange( self.look_ahead ), self.look_ahead )
+
+		unseen_layers = t.cat(
+			(
+				unseen_layers,
+				unseen_layers[ -1 ] + 1 + t.arange( self.look_ahead - 1 )
+			), dim = -1 )
+
+		ql, qh = self.broadcast_logits( ts, mask, cache, unseen_layers, self.look_ahead )
+		alpha = self.mixer_head( ph, qh )
+		logits_loss = ql * alpha + pl * (1 - alpha)
+
+		base_loss = self.compute_cross_entropy_loss(
+			logits_loss, targets_base, mask = mask_base, temperature = self.reinforce_temperature )
+
+		return {
+			"base loss": (base_loss, self.base_loss_beta),
+		}, {
+			"alpha": alpha
+		}, {
+			"pl": pl,
+			"ph": ph,
+			"ql": ql,
+			"qh": qh,
+			"alpha": alpha
+		}
+
+	def training_forward( self, params ):
+		if not isinstance( params.past_key_values, StaticCache ):
+			raise ValueError( "Static cache required for training" )
+
+		# Add an additional batch dimension for the number of thoughts
+		# and truncate the input ids by look_ahead
+		ts = rearrange( "b l -> b n 1 l", params.input_ids[ ..., :-self.look_ahead ], n = self.n_thoughts )
+		padding_mask = rearrange( "b l -> b n l", params.attention_mask, n = self.n_thoughts )
+
+		# Prepare the thought mask, truncating the padding mask by look_ahead
+		mask = self.ThoughtMask(
+			ts.shape[ -1 ],
+			self.thought_depth + 2 + self.look_ahead,
+			self.lm_model.config.num_attention_heads,
+			padding_mask[ ..., :-self.look_ahead ] )
+
+		# Append the start token
+		ts = self.append_layer( ts, self.start_thought_token, dim = -2 )
+
+		# Generate the thoughts
+		logs = None
+		unseen_layers = t.arange( 2 )
+		cache = params.past_key_values
+		for i in range( self.thought_depth ):
+			ts, logs = self.advance_thoughts( ts, logs, mask, cache, unseen_layers )
+			unseen_layers = unseen_layers[ -1: ] + 1
+
+		# Append the end token
+		ts = self.append_layer( ts, self.end_thought_token, dim = -2 )
+		unseen_layers = t.cat( (unseen_layers, unseen_layers[ -1: ] + 1), dim = -1 )
+
+		labels = rearrange( "b l -> b n l", params.labels, n = self.n_thoughts )
+
 		return CausalLMOutputWithPast(
-			loss = aggregate_loss,
-			logits = logits_loss[ ..., -1, :, : ],
-			past_key_values = params.past_key_values
+			loss = self.calculate_loss( ts, cache, unseen_layers, labels, mask, padding_mask, logs ),
 		)
+
+	def get_cache_size( self, batch_size, sequence_length ):
+		return (sequence_length - self.look_ahead) * (
+				self.thought_depth + 2 + self.look_ahead), batch_size * self.n_thoughts
 
 	@inherit_device_and_dtype
 	def forward( self, *args, **kwargs ) -> Union[ Tuple, CausalLMOutputWithPast ]:

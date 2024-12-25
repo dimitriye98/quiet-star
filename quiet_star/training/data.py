@@ -81,13 +81,15 @@ class QuietStarDataModule( pl.LightningDataModule ):
 			preproc_batch_size = 1024,
 			gsm8k_ans_len = 15,
 			csqa_ans_len = 5,
-			max_length = 256,
+			train_max_length = 256,
+			test_val_max_length = 256,
 			n_download_proc = 1,
 			dataloader_workers = min( 16, os.cpu_count() ) ):
 		super().__init__()
 		self.tokenizer = tokenizer
 		self.n_download_proc = n_download_proc
-		self.max_length = max_length
+		self.train_max_length = train_max_length
+		self.test_val_max_length = test_val_max_length
 		self.train_batch_size = train_batch_size
 		self.test_val_batch_size = test_val_batch_size
 		self.preproc_batch_size = preproc_batch_size
@@ -98,7 +100,7 @@ class QuietStarDataModule( pl.LightningDataModule ):
 	def process_owm( self, ds: Dataset ):
 		ret = ds.map(
 			do_tok_owm, batched = True, batch_size = self.preproc_batch_size,
-			fn_kwargs = { "max_length": self.max_length, "tokenizer": self.tokenizer } ).with_format( type = "pt" )
+			fn_kwargs = { "max_length": self.train_max_length, "tokenizer": self.tokenizer } ).with_format( type = "pt" )
 
 		return ret
 
@@ -109,7 +111,7 @@ class QuietStarDataModule( pl.LightningDataModule ):
 			.map(
 				do_tok_eval,
 				fn_kwargs = {
-					"max_length": self.max_length,
+					"max_length": self.test_val_max_length,
 					"ans_len": ans_len,
 					"tokenizer": self.tokenizer },
 				batched = True,

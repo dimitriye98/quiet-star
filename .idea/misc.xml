@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.12 (quiet-star-speedrun)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.12 (sftp://root@69.159.131.90:52260/root/quiet-star/venv/bin/python)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.12 (sftp://root@45.135.56.10:26528/root/quiet-star/.venv/bin/python)" project-jdk-type="Python SDK" />
 </project>

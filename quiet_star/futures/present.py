@@ -1,10 +1,10 @@
 from concurrent import futures
 from concurrent.futures import CancelledError, InvalidStateError
 
-from .abc import StdFuture
+from .abc import RichFuture
 
 
-class Present( StdFuture ):
+class Present( RichFuture ):
 	__slots__ = ( "_result", "_exception", "_cancelled" )
 
 	def __init__( self, future ):

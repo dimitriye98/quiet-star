@@ -1,4 +1,5 @@
 datasets
+deepspeed
 einx[torch]
 lightning
 peft

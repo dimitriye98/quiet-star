@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Protocol
 
-class StdFuture( ABC ):
+class RichFuture( ABC ):
 	""" An abstract class for shadowing the stdlib concurrent.futures.Future class. """
 	@abstractmethod
 	def cancel( self ):

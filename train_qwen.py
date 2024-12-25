@@ -8,11 +8,14 @@ from os import cpu_count
 import einx
 import lightning.pytorch as pl
 import torch as t
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+from lightning.pytorch.strategies import DeepSpeedStrategy
 from peft import get_peft_model, LoraConfig
-from pytorch_lightning.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger
 from toolz import compose_left
-from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, GenerationConfig, StaticCache
+from transformers import AutoTokenizer, GenerationConfig, StaticCache, AdamW, get_linear_schedule_with_warmup
 
+from quiet_star import futures
 from quiet_star.broker import CollectionBroker
 from quiet_star.futures.collected import CollectedFuture
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
@@ -82,16 +85,24 @@ class QuietStar( pl.LightningModule ):
 		)
 		scheduler = { "scheduler": scheduler, "interval": "step", "frequency": 1 }
 		return [ optimizer ], [ scheduler ]
+		# return DeepSpeedCPUAdam(
+		# 	self.model.parameters(),
+		# 	lr = self.hparams.learning_rate,
+		# 	eps = self.hparams.adam_epsilon,
+		# 	weight_decay = self.hparams.weight_decay
+		# )
 
 	def on_train_epoch_start( self ):
-		self.training_cache = StaticCache(
-			max_cache_len = 256 * (3 + self.hparams.look_ahead + self.hparams.thought_depth),
-			batch_size = self.hparams.train_batch_size * self.hparams.n_thoughts,
+		t.cuda.memory._record_memory_history( stacks = "python" )
+
+	def training_step( self, batch, batch_idx ):
+		cache_len, batch_size = self.model.get_cache_size( *batch[ "input_ids" ].shape )
+		training_cache = StaticCache(
+			max_cache_len = cache_len,
+			max_batch_size = batch_size,
 			device = self.device,
 			dtype = self.dtype,
 			config = self.model.config )
-
-	def training_step( self, batch, batch_idx ):
 		if self.hparams.confidence_loss_beta_step_up_start < self.current_epoch <= self.hparams.confidence_loss_beta_step_up_end:
 			# Linear ramp from start to end
 			now = self.current_epoch
@@ -103,8 +114,7 @@ class QuietStar( pl.LightningModule ):
 			self.model.confidence_loss_beta = lower * (1 - lerp) + upper * lerp
 		loss = self.model(
 			input_ids = batch[ "input_ids" ], labels = batch[ "input_ids" ],
-			attention_mask = batch[ "attention_mask" ], past_key_values = self.training_cache ).loss
-		self.training_cache = self.training_cache.reset()
+			attention_mask = batch[ "attention_mask" ], past_key_values = training_cache ).loss
 		if hasattr( self, "profiler" ):
 			self.profiler.step()
 		return loss
@@ -159,18 +169,18 @@ class QuietStar( pl.LightningModule ):
 				future_output_ids_wc,
 				future_logs_wc) )
 
-		tupled_future.add_done_callback(
-			compose_left(
-				lambda f: f.result(),
-				uncurry(
-					lambda b, oidsc, lsc, oidwc, lwc:
-					b | {
-						"output_ids": oidsc,
-						"output_logits": lsc,
-						"confident_output_ids": oidwc,
-						"confident_output_logits": lwc } ),
-				lambda b: self.evaluation_pool.submit( self.evaluate, b, self.validation_pad_token ),
-				self.outputs[ dataloader_idx ].append ) )
+		self.outputs[ dataloader_idx ].append(
+			futures.flatmap(
+				compose_left(
+					uncurry(
+						lambda b, oidsc, lsc, oidwc, lwc:
+						b | {
+							"output_ids": oidsc,
+							"output_logits": lsc,
+							"confident_output_ids": oidwc,
+							"confident_output_logits": lwc } ),
+					lambda b: self.evaluation_pool.submit( self.evaluate, b, self.validation_pad_token ) ),
+				tupled_future ) )
 
 		if hasattr( self, "profiler" ):
 			self.profiler.step()
@@ -196,6 +206,7 @@ class QuietStar( pl.LightningModule ):
 		}
 
 	def on_validation_epoch_end( self ):
+		print( "Awaiting validation results...", flush = True )
 		flat_outputs = [ f.result() for l in self.outputs.values() for f in l ]
 
 		flat_dict = defaultdict( list )
@@ -258,6 +269,8 @@ assert effective_batch_size % acc_grad == 0
 dm = QuietStarDataModule(
 	tokenizer,
 	n_download_proc = 16,
+	train_max_length = 128,
+	test_val_max_length = 256,
 	train_batch_size = effective_batch_size // acc_grad,
 )
 
@@ -286,18 +299,18 @@ def trace_handler( prof ):
 	print( f"Trace saved! Took {et - st:.2f} seconds", flush = True )
 
 
-do_profile = False
+do_profile = True
 
-t.cuda.memory._record_memory_history( stacks = "all" )
+# t.cuda.memory._record_memory_history( stacks = "python" )
 
 with t.profiler.profile(
 		activities = [
 			t.profiler.ProfilerActivity.CPU,
-			# t.profiler.ProfilerActivity.CUDA,
+			t.profiler.ProfilerActivity.CUDA,
 		],
-		schedule = t.profiler.schedule( skip_first = 0, wait = 0, warmup = 10, active = 1, repeat = 1 ),
+		schedule = t.profiler.schedule( skip_first = 0, wait = 0, warmup = 4, active = 3, repeat = 1 ),
 		on_trace_ready = trace_handler,
-		# profile_memory = True,
+		profile_memory = True,
 		with_stack = True,
 		record_shapes = True,
 		experimental_config = t._C._profiler._ExperimentalConfig( verbose = True )
@@ -313,11 +326,21 @@ with t.profiler.profile(
 		logger = logger,
 		precision = "bf16-true",
 		max_epochs = 1,
+		# max_steps = 2,
 		check_val_every_n_epoch = None,
 		val_check_interval = 250,
-		# accelerator = "auto",
+		accelerator = "gpu",
 		# devices = 1,
-		accumulate_grad_batches = acc_grad,
+		# accumulate_grad_batches = acc_grad,
+		accumulate_grad_batches = 1,
+		# strategy = DeepSpeedStrategy(
+		# 	stage = 2,
+		# 	offload_optimizer = True,
+		# 	offload_parameters = True,
+		# 	remote_device = "nvme",
+		# 	offload_optimizer_device = "nvme",
+		# 	nvme_path = "/gradients"
+		# ),
 		callbacks = [ checkpoint_callback ],
 		# enable_progress_bar = False,
 	)
@@ -326,5 +349,9 @@ with t.profiler.profile(
 		trainer.fit( model, datamodule = dm )
 	# trainer.validate( model, datamodule = dm )
 	except t.OutOfMemoryError as e:
-		print( "OOM, dumping memory snapshot...", flush = True )
+		print( "OOM...", flush = True )
+	finally:
 		t.cuda.memory._dump_snapshot( os.path.join( trace_dir, "memory_snapshot.json" ) )
+		prof.step()
+		if prof is not None:
+			prof.export_memory_timeline( os.path.join( trace_dir, "memory_timeline.html" ) )
