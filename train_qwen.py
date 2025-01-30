@@ -50,7 +50,7 @@ class QuietStar( pl.LightningModule ):
 		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
 		self.validation_pad_token = validation_pad_token
 		self.broker = CollectionBroker()
-		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
+		self.evaluation_pool = None
 		self.outputs = defaultdict( list )
 		self.initial_confidence_loss_beta = config.confidence_loss_beta
 
@@ -63,34 +63,34 @@ class QuietStar( pl.LightningModule ):
 
 	def configure_optimizers( self ):
 		"""Prepare optimizer and schedule (linear warmup and decay)."""
-		model = self.model
-		no_decay = [ "bias", "LayerNorm.weight" ]
-		optimizer_grouped_parameters = [
-			{
-				"params": [ p for n, p in model.named_parameters() if not any( nd in n for nd in no_decay ) ],
-				"weight_decay": self.hparams.weight_decay,
-			},
-			{
-				"params": [ p for n, p in model.named_parameters() if any( nd in n for nd in no_decay ) ],
-				"weight_decay": 0.0,
-			},
-		]
-		optimizer = AdamW(
-			optimizer_grouped_parameters, lr = self.hparams.learning_rate, eps = self.hparams.adam_epsilon )
-
-		scheduler = get_linear_schedule_with_warmup(
-			optimizer,
-			num_warmup_steps = self.hparams.warmup_steps,
-			num_training_steps = self.trainer.estimated_stepping_batches,
-		)
-		scheduler = { "scheduler": scheduler, "interval": "step", "frequency": 1 }
-		return [ optimizer ], [ scheduler ]
-		# return DeepSpeedCPUAdam(
-		# 	self.model.parameters(),
-		# 	lr = self.hparams.learning_rate,
-		# 	eps = self.hparams.adam_epsilon,
-		# 	weight_decay = self.hparams.weight_decay
+		# model = self.model
+		# no_decay = [ "bias", "LayerNorm.weight" ]
+		# optimizer_grouped_parameters = [
+		# 	{
+		# 		"params": [ p for n, p in model.named_parameters() if not any( nd in n for nd in no_decay ) ],
+		# 		"weight_decay": self.hparams.weight_decay,
+		# 	},
+		# 	{
+		# 		"params": [ p for n, p in model.named_parameters() if any( nd in n for nd in no_decay ) ],
+		# 		"weight_decay": 0.0,
+		# 	},
+		# ]
+		# optimizer = AdamW(
+		# 	optimizer_grouped_parameters, lr = self.hparams.learning_rate, eps = self.hparams.adam_epsilon )
+		#
+		# scheduler = get_linear_schedule_with_warmup(
+		# 	optimizer,
+		# 	num_warmup_steps = self.hparams.warmup_steps,
+		# 	num_training_steps = self.trainer.estimated_stepping_batches,
 		# )
+		# scheduler = { "scheduler": scheduler, "interval": "step", "frequency": 1 }
+		# return [ optimizer ], [ scheduler ]
+		return DeepSpeedCPUAdam(
+			self.model.parameters(),
+			lr = self.hparams.learning_rate,
+			eps = self.hparams.adam_epsilon,
+			weight_decay = self.hparams.weight_decay
+		)
 
 	def on_train_epoch_start( self ):
 		t.cuda.memory._record_memory_history( stacks = "python" )
@@ -135,6 +135,9 @@ class QuietStar( pl.LightningModule ):
 			)
 		return self._validation_gen_config
 
+	def on_validation_epoch_start(self):
+		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
+
 	def validation_step( self, batch, batch_idx, dataloader_idx = 0 ):
 		output_sans_confidence = self.model.generate(
 			inputs = batch[ "input_ids" ],
@@ -169,6 +172,12 @@ class QuietStar( pl.LightningModule ):
 				future_output_ids_wc,
 				future_logs_wc) )
 
+		print( f"Validation batch {batch_idx} from dataloader {dataloader_idx}", flush = True )
+
+		def debug_print(b):
+			print( f"Batch {b} on CPU, starting evaluation", flush = True )
+			return b
+
 		self.outputs[ dataloader_idx ].append(
 			futures.flatmap(
 				compose_left(
@@ -179,6 +188,7 @@ class QuietStar( pl.LightningModule ):
 							"output_logits": lsc,
 							"confident_output_ids": oidwc,
 							"confident_output_logits": lwc } ),
+					debug_print,
 					lambda b: self.evaluation_pool.submit( self.evaluate, b, self.validation_pad_token ) ),
 				tupled_future ) )
 
@@ -208,6 +218,7 @@ class QuietStar( pl.LightningModule ):
 	def on_validation_epoch_end( self ):
 		print( "Awaiting validation results...", flush = True )
 		flat_outputs = [ f.result() for l in self.outputs.values() for f in l ]
+		self.evaluation_pool = None
 
 		flat_dict = defaultdict( list )
 		for d in flat_outputs:
@@ -330,17 +341,17 @@ with t.profiler.profile(
 		check_val_every_n_epoch = None,
 		val_check_interval = 250,
 		accelerator = "gpu",
-		# devices = 1,
-		# accumulate_grad_batches = acc_grad,
-		accumulate_grad_batches = 1,
-		# strategy = DeepSpeedStrategy(
-		# 	stage = 2,
-		# 	offload_optimizer = True,
-		# 	offload_parameters = True,
-		# 	remote_device = "nvme",
-		# 	offload_optimizer_device = "nvme",
-		# 	nvme_path = "/gradients"
-		# ),
+		devices = 1,
+		accumulate_grad_batches = acc_grad,
+		# accumulate_grad_batches = 1,
+		strategy = DeepSpeedStrategy(
+			stage = 2,
+			offload_optimizer = True,
+			offload_parameters = True,
+			remote_device = "nvme",
+			offload_optimizer_device = "nvme",
+			nvme_path = "/gradients"
+		),
 		callbacks = [ checkpoint_callback ],
 		# enable_progress_bar = False,
 	)
