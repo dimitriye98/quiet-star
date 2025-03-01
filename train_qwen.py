@@ -7,6 +7,7 @@ from os import cpu_count
 
 import einx
 import lightning.pytorch as pl
+import torch
 import torch as t
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning.pytorch.strategies import DeepSpeedStrategy
@@ -26,7 +27,8 @@ from quiet_star.training.data import QuietStarDataModule, uncurry
 
 
 def be_nice():
-	os.nice( 10 )
+	# os.nice( 10 )
+	pass
 
 
 class QuietStar( pl.LightningModule ):
@@ -197,28 +199,50 @@ class QuietStar( pl.LightningModule ):
 
 	@staticmethod
 	def evaluate( batch, pad_token ):
+		print("Doing evaluation", flush = True)
+		evalstarttime = time.time()
+
+		stat = "loss nc"
+
+		@torch.no_grad()
 		def compute_losses( l, a ):
 			l_ = einx.rearrange( "... v -> (...) v", l )
+			print(f"{ stat } l_ transform { time.time() - evalstarttime }", flush = True)
 			a_ = einx.rearrange( "... -> (...)", a )
+			print(f"{ stat } a_ transform { time.time() - evalstarttime }", flush = True)
 			losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" )
+			print(f"{ stat } losses { time.time() - evalstarttime }", flush = True)
 			losses = einx.rearrange( "(b... s) -> b... s", losses, **einx.solve( "b... s", a ) )
+			print(f"{ stat } losses rearrange { time.time() - evalstarttime }", flush = True)
 			losses = einx.where( "... s, , ... s", a == pad_token, t.nan, losses )
-			return losses.nanmean( dim = -1 )
+			print(f"{ stat } losses where { time.time() - evalstarttime }", flush = True)
+			ret = losses.nanmean( dim = -1 )
+			print(f"{ stat } losses nanmean { time.time() - evalstarttime }", flush = True)
+			return ret
 
 		def check_accuracy( s, a ):
 			return ((s == a) | (a == pad_token)).all( dim = -1 ).to( t.float32 )
 
-		return {
-			"loss (no confidence)": compute_losses( batch[ "output_logits" ], batch[ "answer" ] ),
+		lossnc = compute_losses( batch[ "output_logits" ], batch[ "answer" ] )
+		stat = "loss wc"
+		losswc = compute_losses( batch[ "confident_output_logits" ], batch[ "answer" ] )
+
+		ret = {
+			"loss (no confidence)": lossnc,
 			"one-shot accuracy (no confidence)": check_accuracy( batch[ "output_ids" ], batch[ "answer" ] ),
-			"loss (with confidence)": compute_losses( batch[ "confident_output_logits" ], batch[ "answer" ] ),
+			"loss (with confidence)": losswc,
 			"one-shot accuracy (with confidence)": check_accuracy( batch[ "confident_output_ids" ], batch[ "answer" ] ),
 		}
+
+		print(f"Evaluation took { time.time() - evalstarttime } seconds", flush = True)
+
+		return ret
 
 	def on_validation_epoch_end( self ):
 		print( "Awaiting validation results...", flush = True )
 		flat_outputs = [ f.result() for l in self.outputs.values() for f in l ]
-		self.evaluation_pool = None
+		# self.evaluation_pool = None
+		self.evaluation_pool.shutdown( wait = True, cancel_futures = False )
 
 		flat_dict = defaultdict( list )
 		for d in flat_outputs:
