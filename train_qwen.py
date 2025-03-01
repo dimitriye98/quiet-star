@@ -1,26 +1,26 @@
 import os
+import queue
 import time
 from collections import defaultdict
-from concurrent.futures.process import ProcessPoolExecutor
 from contextlib import nullcontext
+from multiprocessing import Process, Queue
 from os import cpu_count
+from threading import Thread
+from typing import Callable
 
 import einx
 import lightning.pytorch as pl
 import torch
 import torch as t
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from lightning.pytorch.strategies import DeepSpeedStrategy
-from peft import get_peft_model, LoraConfig
 from lightning.pytorch.loggers import WandbLogger
-from toolz import compose_left
-from transformers import AutoTokenizer, GenerationConfig, StaticCache, AdamW, get_linear_schedule_with_warmup
+from lightning.pytorch.strategies import DeepSpeedStrategy
+from lightning_utilities import apply_to_collection
+from peft import get_peft_model, LoraConfig
+from transformers import AutoTokenizer, GenerationConfig, StaticCache
 
-from quiet_star import futures
-from quiet_star.broker import CollectionBroker
-from quiet_star.futures.collected import CollectedFuture
 from quiet_star.qwen import QwenThoughtModelConfig, QwenThoughtModel
-from quiet_star.training.data import QuietStarDataModule, uncurry
+from quiet_star.training.data import QuietStarDataModule
 
 
 # warnings.filterwarnings( "error", category = UserWarning, module = 'torch' )
@@ -29,6 +29,146 @@ from quiet_star.training.data import QuietStarDataModule, uncurry
 def be_nice():
 	# os.nice( 10 )
 	pass
+
+
+class ToCPUWorker( Thread ):
+	def __init__( self, q_in, q_out ):
+		super().__init__()
+		self.q_in = q_in
+		self.q_out = q_out
+		self.daemon = True
+
+	@staticmethod
+	def transfer_tensor( tensor ):
+		print( "Transferring tensor", flush = True )
+		stream = t.cuda.Stream()
+		with t.cuda.stream( stream ):
+			receive = t.empty( tensor.shape, dtype = tensor.dtype, device = "cpu", pin_memory = True )
+			receive.copy_( tensor )
+			# We have to copy again, as the receiving tensor *must* be pinned
+			# for the transfer to not block the GPU
+			# however, holding pinned memory can be expensive,
+			# so we only keep the data in pinned memory if instructed
+			# if not pin_memory:
+			unpinned = t.empty( tensor.shape, dtype = tensor.dtype, device = "cpu" )
+			unpinned.copy_( receive )
+			print( "Transferred tensor", flush = True )
+			return unpinned
+
+	@classmethod
+	def do_transfer( cls, data ):
+		return apply_to_collection( data, t.Tensor, cls.transfer_tensor )
+
+	def run( self ):
+		while True:
+			data = self.q_in.get()
+			self.q_out.put( self.do_transfer( data ) )
+
+
+class EvaluationWorker( Process ):
+	def __init__( self, q_in, q_out ):
+		super().__init__()
+		self.q_in = q_in
+		self.q_out = q_out
+
+	@staticmethod
+	def evaluate( data ):
+		return data
+
+	def run( self ):
+		while True:
+			data = self.q_in.get()
+			self.q_out.put( self.evaluate( data ) )
+
+
+class Evaluator:
+	def __init__(
+			self, *,
+			factory_transfer_worker: Callable[ [ Queue, Queue ], ToCPUWorker ] = ToCPUWorker,
+			n_transfer_worker = None,
+			factory_evaluator_worker: Callable[ [ Queue, Queue ], EvaluationWorker ] = EvaluationWorker,
+			n_evaluator_worker = None ):
+		if n_transfer_worker is None:
+			n_transfer_worker = min(16, cpu_count())
+		if n_evaluator_worker is None:
+			n_evaluator_worker = min(16, cpu_count())
+
+		self.counter = 0
+		self.q_in = queue.Queue()
+		self.q_mid = Queue()
+		self.q_out = Queue()
+
+		self.transfer_workers = [ factory_transfer_worker( self.q_in, self.q_mid ) for _ in range( n_transfer_worker ) ]
+		self.evaluator_workers = [ factory_evaluator_worker( self.q_mid, self.q_out ) for _ in
+			range( n_evaluator_worker ) ]
+
+		for w in self.transfer_workers:
+			w.daemon = True
+			w.start()
+
+		for w in self.evaluator_workers:
+			w.daemon = True
+			w.start()
+
+	# Enqueues data for transfer to CPU and evaluation in a separate process
+	def submit( self, data ):
+		self.counter += 1
+		self.q_in.put( data )
+
+	# Blocks until all enqueued data has been evaluated
+	def collect( self ):
+		ret = [ ]
+		while self.counter > 0:
+			ret.append( self.q_out.get() )
+			self.counter -= 1
+		return ret
+
+
+class QuietStarEvaluationWorker( EvaluationWorker ):
+	def __init__( self, q_in, q_out, pad_token ):
+		super().__init__( q_in, q_out )
+		self.pad_token = pad_token
+
+	def evaluate( self, batch ):
+		print( "Doing evaluation", flush = True )
+		print( f"Batch: {batch}", flush = True )
+		evalstarttime = time.time()
+
+		stat = "loss nc"
+
+		@torch.no_grad()
+		def compute_losses( l, a ):
+			l_ = einx.rearrange( "... v -> (...) v", l )
+			print( f"{stat} l_ transform {time.time() - evalstarttime}", flush = True )
+			a_ = einx.rearrange( "... -> (...)", a )
+			print( f"{stat} a_ transform {time.time() - evalstarttime}", flush = True )
+			losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" )
+			print( f"{stat} losses {time.time() - evalstarttime}", flush = True )
+			losses = einx.rearrange( "(b... s) -> b... s", losses, **einx.solve( "b... s", a ) )
+			print( f"{stat} losses rearrange {time.time() - evalstarttime}", flush = True )
+			losses = einx.where( "... s, , ... s", a == self.pad_token, t.nan, losses )
+			print( f"{stat} losses where {time.time() - evalstarttime}", flush = True )
+			ret = losses.nanmean( dim = -1 )
+			print( f"{stat} losses nanmean {time.time() - evalstarttime}", flush = True )
+			return ret
+
+		def check_accuracy( s, a ):
+			return ((s == a) | (a == self.pad_token)).all( dim = -1 ).to( t.float32 )
+
+		lossnc = compute_losses( batch[ "output_logits" ], batch[ "answer" ] )
+		stat = "loss wc"
+		losswc = compute_losses( batch[ "confident_output_logits" ], batch[ "answer" ] )
+
+		ret = {
+			"loss (no confidence)": lossnc,
+			"one-shot accuracy (no confidence)": check_accuracy( batch[ "output_ids" ], batch[ "answer" ] ),
+			"loss (with confidence)": losswc,
+			"one-shot accuracy (with confidence)": check_accuracy( batch[ "confident_output_ids" ], batch[ "answer" ] ),
+		}
+
+		print( f"Evaluation took {time.time() - evalstarttime} seconds", flush = True )
+
+		return ret
 
 
 class QuietStar( pl.LightningModule ):
@@ -49,19 +189,17 @@ class QuietStar( pl.LightningModule ):
 			confidence_loss_beta_step_up_end = 3000,
 			**kwargs ):
 		super().__init__()
-		self.save_hyperparameters( ignore = [ "validation_pad_token" ] )
+		self.save_hyperparameters()
 		self.validation_pad_token = validation_pad_token
-		self.broker = CollectionBroker()
-		self.evaluation_pool = None
 		self.outputs = defaultdict( list )
 		self.initial_confidence_loss_beta = config.confidence_loss_beta
-
-	def __del__( self ):
-		self.evaluation_pool.shutdown( wait = False, cancel_futures = True )
 
 	def configure_model( self ):
 		self.model = self.hparams.model_factory( self.hparams.config )
 		self.model.logger = self.log_dict
+		self.evaluator = Evaluator(
+			factory_evaluator_worker = lambda q_in, q_out: QuietStarEvaluationWorker(
+				q_in, q_out, self.hparams.validation_pad_token ) )
 
 	def configure_optimizers( self ):
 		"""Prepare optimizer and schedule (linear warmup and decay)."""
@@ -137,8 +275,8 @@ class QuietStar( pl.LightningModule ):
 			)
 		return self._validation_gen_config
 
-	def on_validation_epoch_start(self):
-		self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
+	# def on_validation_epoch_start(self):
+	# 	self.evaluation_pool = ProcessPoolExecutor( max_workers = cpu_count() - 1, initializer = be_nice )
 
 	def validation_step( self, batch, batch_idx, dataloader_idx = 0 ):
 		output_sans_confidence = self.model.generate(
@@ -149,9 +287,8 @@ class QuietStar( pl.LightningModule ):
 
 		logs_sc = t.cat( [ l.unsqueeze( 0 ) for l in output_sans_confidence.logits ], dim = 0 )
 		logs_sc = einx.rearrange( "c ... v -> ... c v", logs_sc )
-		future_output_ids_sc = self.broker( output_sans_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ] )
-		future_logs_sc = self.broker( logs_sc )
-		del output_sans_confidence, logs_sc
+		output_ids_sc = output_sans_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
+		del output_sans_confidence
 
 		output_with_confidence = self.model.generate(
 			inputs = batch[ "input_ids" ],
@@ -162,87 +299,23 @@ class QuietStar( pl.LightningModule ):
 
 		logs_wc = t.cat( [ l.unsqueeze( 0 ) for l in output_with_confidence.logits ], dim = 0 )
 		logs_wc = einx.rearrange( "c ... v -> ... c v", logs_wc )
-		future_output_ids_wc = self.broker( output_with_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ] )
-		future_logs_wc = self.broker( logs_wc )
-		future_batch = self.broker( batch )
+		output_ids_wc = output_with_confidence.sequences[ ..., -batch[ "answer" ].shape[ -1 ]: ]
 
-		tupled_future = CollectedFuture(
-			(
-				future_batch,
-				future_output_ids_sc,
-				future_logs_sc,
-				future_output_ids_wc,
-				future_logs_wc) )
+		print("Submitting to evaluator", flush = True)
 
-		print( f"Validation batch {batch_idx} from dataloader {dataloader_idx}", flush = True )
-
-		def debug_print(b):
-			print( f"Batch {b} on CPU, starting evaluation", flush = True )
-			return b
-
-		self.outputs[ dataloader_idx ].append(
-			futures.flatmap(
-				compose_left(
-					uncurry(
-						lambda b, oidsc, lsc, oidwc, lwc:
-						b | {
-							"output_ids": oidsc,
-							"output_logits": lsc,
-							"confident_output_ids": oidwc,
-							"confident_output_logits": lwc } ),
-					debug_print,
-					lambda b: self.evaluation_pool.submit( self.evaluate, b, self.validation_pad_token ) ),
-				tupled_future ) )
+		self.evaluator.submit(
+			batch | {
+				"output_ids": output_ids_sc,
+				"output_logits": logs_sc,
+				"confident_output_ids": output_ids_wc,
+				"confident_output_logits": logs_wc } )
 
 		if hasattr( self, "profiler" ):
 			self.profiler.step()
 
-	@staticmethod
-	def evaluate( batch, pad_token ):
-		print("Doing evaluation", flush = True)
-		evalstarttime = time.time()
-
-		stat = "loss nc"
-
-		@torch.no_grad()
-		def compute_losses( l, a ):
-			l_ = einx.rearrange( "... v -> (...) v", l )
-			print(f"{ stat } l_ transform { time.time() - evalstarttime }", flush = True)
-			a_ = einx.rearrange( "... -> (...)", a )
-			print(f"{ stat } a_ transform { time.time() - evalstarttime }", flush = True)
-			losses = t.nn.functional.cross_entropy( l_, a_, reduction = "none" )
-			print(f"{ stat } losses { time.time() - evalstarttime }", flush = True)
-			losses = einx.rearrange( "(b... s) -> b... s", losses, **einx.solve( "b... s", a ) )
-			print(f"{ stat } losses rearrange { time.time() - evalstarttime }", flush = True)
-			losses = einx.where( "... s, , ... s", a == pad_token, t.nan, losses )
-			print(f"{ stat } losses where { time.time() - evalstarttime }", flush = True)
-			ret = losses.nanmean( dim = -1 )
-			print(f"{ stat } losses nanmean { time.time() - evalstarttime }", flush = True)
-			return ret
-
-		def check_accuracy( s, a ):
-			return ((s == a) | (a == pad_token)).all( dim = -1 ).to( t.float32 )
-
-		lossnc = compute_losses( batch[ "output_logits" ], batch[ "answer" ] )
-		stat = "loss wc"
-		losswc = compute_losses( batch[ "confident_output_logits" ], batch[ "answer" ] )
-
-		ret = {
-			"loss (no confidence)": lossnc,
-			"one-shot accuracy (no confidence)": check_accuracy( batch[ "output_ids" ], batch[ "answer" ] ),
-			"loss (with confidence)": losswc,
-			"one-shot accuracy (with confidence)": check_accuracy( batch[ "confident_output_ids" ], batch[ "answer" ] ),
-		}
-
-		print(f"Evaluation took { time.time() - evalstarttime } seconds", flush = True)
-
-		return ret
-
 	def on_validation_epoch_end( self ):
 		print( "Awaiting validation results...", flush = True )
-		flat_outputs = [ f.result() for l in self.outputs.values() for f in l ]
-		# self.evaluation_pool = None
-		self.evaluation_pool.shutdown( wait = True, cancel_futures = False )
+		flat_outputs = self.evaluator.collect()
 
 		flat_dict = defaultdict( list )
 		for d in flat_outputs:
@@ -334,7 +407,7 @@ def trace_handler( prof ):
 	print( f"Trace saved! Took {et - st:.2f} seconds", flush = True )
 
 
-do_profile = True
+do_profile = False
 
 # t.cuda.memory._record_memory_history( stacks = "python" )
 
