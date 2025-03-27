@@ -40,7 +40,7 @@ class ToCPUWorker( Thread ):
 
 	@staticmethod
 	def transfer_tensor( tensor ):
-		print( "Transferring tensor", flush = True )
+		# print( "Transferring tensor", flush = True )
 		stream = t.cuda.Stream()
 		with t.cuda.stream( stream ):
 			receive = t.empty( tensor.shape, dtype = tensor.dtype, device = "cpu", pin_memory = True )
@@ -52,7 +52,7 @@ class ToCPUWorker( Thread ):
 			# if not pin_memory:
 			unpinned = t.empty( tensor.shape, dtype = tensor.dtype, device = "cpu" )
 			unpinned.copy_( receive )
-			print( "Transferred tensor", flush = True )
+			# print( "Transferred tensor", flush = True )
 			return unpinned
 
 	@classmethod
@@ -371,14 +371,14 @@ def model_factory( config ):
 
 
 effective_batch_size = 8
-acc_grad = 8
+acc_grad = 4
 assert effective_batch_size % acc_grad == 0
 
 dm = QuietStarDataModule(
 	tokenizer,
 	n_download_proc = 16,
-	train_max_length = 128,
-	test_val_max_length = 256,
+	train_max_length = 32,
+	test_val_max_length = 32,
 	train_batch_size = effective_batch_size // acc_grad,
 )
 
@@ -436,19 +436,19 @@ with t.profiler.profile(
 		max_epochs = 1,
 		# max_steps = 2,
 		check_val_every_n_epoch = None,
-		val_check_interval = 250,
+		val_check_interval = 100,
 		accelerator = "gpu",
 		devices = 1,
 		accumulate_grad_batches = acc_grad,
 		# accumulate_grad_batches = 1,
-		strategy = DeepSpeedStrategy(
-			stage = 2,
-			offload_optimizer = True,
-			offload_parameters = True,
-			remote_device = "nvme",
-			offload_optimizer_device = "nvme",
-			nvme_path = "/gradients"
-		),
+		# strategy = DeepSpeedStrategy(
+		# 	stage = 3,
+		# 	offload_optimizer = True,
+		# 	offload_parameters = True,
+		# 	remote_device = "nvme",
+		# 	offload_optimizer_device = "nvme",
+		# 	nvme_path = "./gradients"
+		# ),
 		callbacks = [ checkpoint_callback ],
 		# enable_progress_bar = False,
 	)
