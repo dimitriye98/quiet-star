@@ -763,7 +763,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 
 		return out_log, out_hidden
 
-	def advance_thoughts( self, ts, logs, mask, cache, unseen_layers ):
+	def advance_thoughts( self, ts, mask, cache, unseen_layers ):
 		new_logs, _ = self.broadcast_logits( ts, mask, cache, unseen_layers )
 
 		with t.no_grad():
@@ -773,9 +773,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				tok = gumbel_softmax(
 					new_logs, tau = self.thought_temperature, hard = True ).argmax( dim = -1 )
 
-		return self.cat_not_null( (ts, tok), dim = -2 ), self.cat_not_null( (logs, new_logs), dim = -3 )
+		return self.cat_not_null( (ts, tok), dim = -2 )
 
-	def calculate_loss( self, ts, cache, unseen_layers, labels, mask, padding_mask, logits_thought ):
+	def calculate_loss( self, ts, cache, unseen_layers, labels, mask, padding_mask ):
 		losses = OrderedDict()
 		metrics = OrderedDict()
 		misc_state = { }
@@ -789,9 +789,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 
 		ts = t.cat( (ts, naive_state[ ..., 1:, : ]), dim = -2 )
 
+		# Generate all logits in a single pass
+		logits, hidden_states = self.broadcast_logits( ts, mask, None, unseen_layers, None )
+
 		for fn in self.loss_fns:
 			new_losses, new_metrics, new_state = fn(
-				cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+				cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits, hidden_states, unseen_layers, losses,
 				metrics, misc_state )
 
 			losses.update( new_losses )
@@ -827,7 +830,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		return aggregate_loss
 
 	def calculate_confidence_loss(
-			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits, hidden_states, unseen_layers, losses,
 			metrics, misc_state ):
 		# Shift the thoughts one step forward
 		cts = t.cat(
@@ -861,9 +864,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		}, { }
 
 	def calculate_policy_loss(
-			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits, hidden_states, unseen_layers, losses,
 			metrics, misc_state ):
 		thoughts = ts[ ..., 2:2 + self.thought_depth, : ]
+
+		# Logits are off by one from tokens
+		logits_thought = logits[ ..., 1:1 + self.thought_depth, :, : ]
 
 		policy_loss, policy_metrics = self.compute_policy_loss(
 			losses[ "base loss" ][ 0 ], logits_thought, thoughts, mask = sliding_mask[ ..., :1, : ],
@@ -876,10 +882,11 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		}, { }
 
 	def calculate_base_loss(
-			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits_thought, unseen_layers, losses,
+			self, cache, mask, naive_state, sliding_labels, sliding_mask, ts, logits, hidden_states, unseen_layers, losses,
 			metrics, misc_state ):
 		targets_base, mask_base = sliding_labels[ ..., 1:, : ], sliding_mask[ ..., :-1, : ]
 
+		# TODO: Implement cache use here
 		pl, ph = self.broadcast_logits( naive_state, mask, None, t.arange( self.look_ahead ), self.look_ahead )
 
 		unseen_layers = t.cat(
@@ -888,7 +895,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 				unseen_layers[ -1 ] + 1 + t.arange( self.look_ahead - 1 )
 			), dim = -1 )
 
-		ql, qh = self.broadcast_logits( ts, mask, cache, unseen_layers, self.look_ahead )
+		# ql, qh = self.broadcast_logits( ts, mask, cache, unseen_layers, self.look_ahead )
+		ql, qh = logits[..., -self.look_ahead:, :, :], hidden_states[..., -self.look_ahead:, :, :]
 		alpha = self.mixer_head( ph, qh )
 		logits_loss = ql * alpha + pl * (1 - alpha)
 
@@ -916,32 +924,32 @@ class ThoughtModel( PreTrainedModel, GenerationMixin, ABC ):
 		ts = rearrange( "b l -> b n 1 l", params.input_ids[ ..., :-self.look_ahead ], n = self.n_thoughts )
 		padding_mask = rearrange( "b l -> b n l", params.attention_mask, n = self.n_thoughts )
 
-		# Prepare the thought mask, truncating the padding mask by look_ahead
-		mask = self.ThoughtMask(
-			ts.shape[ -1 ],
-			self.thought_depth + 2 + self.look_ahead,
-			self.lm_model.config.num_attention_heads,
-			padding_mask[ ..., :-self.look_ahead ] )
+		with t.no_grad():
+			# Prepare the thought mask, truncating the padding mask by look_ahead
+			mask = self.ThoughtMask(
+				ts.shape[ -1 ],
+				self.thought_depth + 2 + self.look_ahead,
+				self.lm_model.config.num_attention_heads,
+				padding_mask[ ..., :-self.look_ahead ] )
 
-		# Append the start token
-		ts = self.append_layer( ts, self.start_thought_token, dim = -2 )
+			# Append the start token
+			ts = self.append_layer( ts, self.start_thought_token, dim = -2 )
 
-		# Generate the thoughts
-		logs = None
-		unseen_layers = t.arange( 2 )
-		cache = params.past_key_values
-		for i in range( self.thought_depth ):
-			ts, logs = self.advance_thoughts( ts, logs, mask, cache, unseen_layers )
-			unseen_layers = unseen_layers[ -1: ] + 1
+			# Generate the thoughts
+			unseen_layers = t.arange( 2 )
+			cache = params.past_key_values
+			for i in range( self.thought_depth ):
+				ts = self.advance_thoughts( ts, mask, cache, unseen_layers )
+				unseen_layers = unseen_layers[ -1: ] + 1
 
-		# Append the end token
-		ts = self.append_layer( ts, self.end_thought_token, dim = -2 )
-		unseen_layers = t.cat( (unseen_layers, unseen_layers[ -1: ] + 1), dim = -1 )
+			# Append the end token
+			ts = self.append_layer( ts, self.end_thought_token, dim = -2 )
+			unseen_layers = t.cat( (unseen_layers, unseen_layers[ -1: ] + 1), dim = -1 )
 
-		labels = rearrange( "b l -> b n l", params.labels, n = self.n_thoughts )
+			labels = rearrange( "b l -> b n l", params.labels, n = self.n_thoughts )
 
 		return CausalLMOutputWithPast(
-			loss = self.calculate_loss( ts, cache, unseen_layers, labels, mask, padding_mask, logs ),
+			loss = self.calculate_loss( ts, cache, unseen_layers, labels, mask, padding_mask ),
 		)
 
 	def get_cache_size( self, batch_size, sequence_length ):
